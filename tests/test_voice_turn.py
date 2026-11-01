@@ -8,6 +8,7 @@ import json
 import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -828,3 +829,161 @@ def test_example_nodes_json_has_device_medium(monkeypatch):
     assert gateway.resolve_device_medium("phone") == ("iphone", "phone-app")
     assert gateway.resolve_device_medium("kitchen-speaker") == ("pi", "room-speaker")
     assert gateway.resolve_device_medium("nope") == ("", "")
+
+
+# --------------------------------------------------------------------------
+# per-request target: a node lists the agents a request may pick
+# --------------------------------------------------------------------------
+
+PHONE = {"phone": {"target": "agent", "targets": ["agent", "helper"]}}
+
+
+def _write_nodes(tmp_path, nodes):
+    (tmp_path / "nodes.json").write_text(json.dumps(nodes))
+
+
+def _voice_turn_log(tmp_path, name="lomin.jsonl"):
+    """The /voice/turn log line in `name` (request log or latency log). Written as
+    the turn ends, so poll briefly."""
+    for _ in range(40):
+        f = tmp_path / name
+        recs = [json.loads(l) for l in f.read_text().splitlines()
+                if '"/voice/turn"' in l] if f.exists() else []
+        if recs:
+            return recs[-1]
+        time.sleep(0.05)
+    raise AssertionError(f"no /voice/turn line in {name}")
+
+
+@pytest.fixture()
+def targets(monkeypatch, stubs):
+    """The brain leg each brain call sees. Read in the worker thread, where
+    _FRAME_CTX.ctx carries the request's target."""
+    seen = []
+
+    def brain_target(prompt, session_id, node_id, speaker, speaker_score, timeout, on_partial):
+        seen.append(gateway._call_target(node_id))
+        return "Fine."
+
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", brain_target)
+    return seen
+
+
+@pytest.fixture()
+def frame_ctx():
+    """This thread's frame context, cleared before and after the test."""
+    def clear():
+        try:
+            del gateway._FRAME_CTX.ctx
+        except AttributeError:
+            pass
+    clear()
+    yield gateway._FRAME_CTX
+    clear()
+
+
+def test_listed_target_reaches_the_brain_and_is_logged(server, targets, tmp_path):
+    _write_nodes(tmp_path, PHONE)
+    turn(server, {"node_id": "phone", "target": "helper"})
+    assert targets == ["helper"]
+    rec = _voice_turn_log(tmp_path)
+    assert rec["target"] == "helper" and "target_rejected" not in rec
+    assert _voice_turn_log(tmp_path, "voice-latency.jsonl")["target"] == "helper"
+
+
+def test_unlisted_target_falls_back_to_node_target(server, targets, tmp_path):
+    _write_nodes(tmp_path, PHONE)
+    turn(server, {"node_id": "phone", "target": "intruder"})
+    assert targets == ["agent"]
+    rec = _voice_turn_log(tmp_path)
+    assert rec["target"] == "agent" and rec["target_rejected"] is True
+
+
+def test_absent_target_uses_node_target(server, targets, tmp_path):
+    _write_nodes(tmp_path, PHONE)
+    turn(server, {"node_id": "phone"})
+    assert targets == ["agent"]
+    rec = _voice_turn_log(tmp_path)
+    assert rec["target"] == "agent" and "target_rejected" not in rec
+
+
+def test_node_without_targets_key_ignores_request_target(server, targets, tmp_path):
+    _write_nodes(tmp_path, {"phone": {"target": "agent"}})
+    turn(server, {"node_id": "phone", "target": "helper"})
+    assert targets == ["agent"]
+
+
+def test_string_targets_is_not_a_list(server, targets, tmp_path):
+    _write_nodes(tmp_path, {"phone": {"target": "agent", "targets": "helper"}})
+    turn(server, {"node_id": "phone", "target": "helper"})
+    assert targets == ["agent"]
+
+
+@pytest.mark.parametrize("nodes,requested,expected", [
+    ({"phone": {"target": "node-b", "targets": ["agent", "helper"]}}, "helper", "helper"),
+    ({"phone": {"target": "node-b", "targets": ["agent", "helper"]}}, " helper ", "helper"),
+    ({"phone": {"target": "node-b", "targets": ["agent", "helper"]}}, "intruder", "node-b"),
+    ({"phone": {"target": "node-b", "targets": ["agent", "helper"]}}, None, "node-b"),
+    ({"phone": {"target": "node-b"}}, "helper", "node-b"),
+    ({"phone": {"target": "node-b", "targets": "helper"}}, "helper", "node-b"),
+], ids=["listed", "whitespace-padded", "unlisted", "absent", "no-targets-key", "string-targets"])
+def test_resolve_request_target(tmp_path, nodes, requested, expected):
+    # node-b is not DEFAULT_TARGET, so a fallback to the default is visible
+    _write_nodes(tmp_path, nodes)
+    assert gateway.resolve_request_target("phone", requested) == expected
+
+
+def test_call_target_without_frame_context_is_node_target(tmp_path, frame_ctx):
+    _write_nodes(tmp_path, {"phone": {"target": "node-b"}})
+    assert gateway._call_target("phone") == gateway.resolve_target("phone") == "node-b"
+
+
+def test_plugin_brain_call_uses_request_target(frame_ctx, monkeypatch):
+    seen = []
+    monkeypatch.setattr(gateway, "_plugin_brain_call",
+                        lambda target, prompt, timeout: (seen.append(target), "ok")[1])
+    frame_ctx.ctx = gateway.make_frame_ctx(None, target="helper")
+    assert gateway.plugin_brain_call("hi", "s", "phone", "", None, 5) == "ok"
+    assert seen == ["helper"]
+
+
+def test_plugin_brain_call_stream_uses_request_target(frame_ctx, monkeypatch):
+    seen = []
+
+    def stream(target, prompt, timeout, on_partial, stages_out):
+        seen.append(target)
+        on_partial("ok")
+        return "ok"
+
+    monkeypatch.setattr(gateway, "_plugin_brain_call_stream", stream)
+    frame_ctx.ctx = gateway.make_frame_ctx(None, target="helper")
+    assert gateway.plugin_brain_call_stream("hi", "s", "phone", "", None, 5, lambda t: None) == "ok"
+    assert seen == ["helper"]
+
+
+def test_http_brain_call_sends_request_target(frame_ctx, monkeypatch):
+    bodies = []
+
+    class Brain(BaseHTTPRequestHandler):
+        def do_POST(self):
+            bodies.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            out = json.dumps({"reply": "ok"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Brain)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(gateway, "MVG_BRAIN_URL", f"http://127.0.0.1:{srv.server_address[1]}/brain")
+        frame_ctx.ctx = gateway.make_frame_ctx(None, target="helper")
+        assert gateway.http_brain_call("hi", "s", "phone", "", None, 5) == "ok"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert bodies[0]["target"] == "helper"

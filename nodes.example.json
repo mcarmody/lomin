@@ -1,4 +1,4 @@
 {
   "kitchen-speaker": {"target": "agent", "open_room": false, "device": "pi", "medium": "room-speaker"},
-  "phone": {"target": "agent", "device": "iphone", "medium": "phone-app"}
+  "phone": {"target": "agent", "targets": ["agent", "helper"], "device": "iphone", "medium": "phone-app"}
 }

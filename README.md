@@ -773,6 +773,7 @@ fields, or a raw WAV body with the same flags in the query string.
 | Field / query | Meaning |
 |---|---|
 | `node_id` | required; picks the nodes.json profile |
+| `target` | optional; the agent that answers this request. Used only if the node's profile lists it in `targets`, else the node's `target` |
 | `open_room` | `1` runs the addressed gate (default: the profile's) |
 | `tts` | `stream` (PCM sentences, default) / `wav` / `none` |
 | `session_id` | conversation continuity |
@@ -804,7 +805,7 @@ Events: `turn{turn_id,node_id}`, `state{state: transcribing|classifying|thinking
 `audio_chunk{chunk_index,format,is_final,data,sample_rate?,channels?}` (opt-in), `reply{reply,text,tts_engine}`,
 `done{duration_ms}`, `error{error,message}`.
 
-Profiles (`nodes.json`): `target`, `open_room`, `identify`, `speech_gate`,
+Profiles (`nodes.json`): `target`, `targets`, `open_room`, `identify`, `speech_gate`,
 `gap_fill`, `reply_cap_words`, `audio_chunk`, `capture_audio`, `device`, `medium`
 (the last two are the node's default device/medium tags, overridden by the
 request). Read per request.
@@ -824,6 +825,8 @@ fresh on every call. If `nodes.json` is absent the old `node-targets.json`
 (`{node: target}`) is read instead. A `node_id` with no profile — including a
 blank one — uses the defaults and answers from `MVG_DEFAULT_TARGET` (`agent`). Only which leg answers changes; the reply still comes back out of the
 device that asked.
+
+A node may list `targets`, the agents a request may pick: a `/voice/turn` request's `target` field is used only if listed, else the node's `target`.
 
 Every brain call (`/voice/turn`, `/ask`, `/ask/stream`) is framed by one helper,
 `frame_voice_prompt`:

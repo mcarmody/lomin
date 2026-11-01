@@ -102,7 +102,9 @@ default $MVG_HOME/nodes.json; target, open_room, identify, speech_gate,
 gap_fill, reply_cap_words, audio_chunk); MVG_NODE_TARGETS (a JSON object, env)
 overrides a node's target. If nodes.json is absent the old node-targets.json
 ({node: target}) is read instead. Any node_id not in the mapping falls back to
-DEFAULT_TARGET (MVG_DEFAULT_TARGET, default "agent"). Only the leg that answers
+DEFAULT_TARGET (MVG_DEFAULT_TARGET, default "agent"). A node may list `targets`,
+the agents a request may pick: a `/voice/turn` request's `target` field is used
+only if listed, else the node's `target`. Only the leg that answers
 changes — the reply still comes back out of the device that asked, because the
 hub replies on that device's own stream.
 
@@ -1416,6 +1418,7 @@ def identify_speaker(wav_bytes: bytes, sha: str) -> tuple[str, float]:
 
 PROFILE_DEFAULTS = {
     "target": None,          # None -> DEFAULT_TARGET
+    "targets": [],           # agents a request may pick with `target` (empty: none)
     "open_room": False,      # per request, profile default
     "identify": True,
     "speech_gate": True,
@@ -1509,6 +1512,15 @@ def resolve_target(node_id: str) -> str:
     return resolve_profile(node_id)["target"]
 
 
+def resolve_request_target(node_id: str, requested) -> str:
+    """The leg that answers this request: `requested` if the node's profile
+    lists it in `targets`, else the node's own target."""
+    prof = resolve_profile(node_id)
+    req = requested.strip() if isinstance(requested, str) else ""
+    allowed = [t for t in prof.get("targets") or [] if isinstance(t, str) and t]
+    return req if req and req in allowed else prof["target"]
+
+
 # --- Voice framing (one helper for every brain call) --------------------------
 
 SPOKEN_SUFFIX = ("This reply will be spoken aloud: plain sentences, no markdown, "
@@ -1557,10 +1569,11 @@ def legacy_voice_id(speaker: str, speaker_score) -> dict:
 
 def make_frame_ctx(voice_id: dict | None, claimed_speaker: str = "", open_room: bool = False,
                    reply_cap_words: int = 60, enrolled: str | None = None,
-                   device: str = "", medium: str = "") -> dict:
+                   device: str = "", medium: str = "", target: str = "") -> dict:
     return {"enrolled": enrolled, "voice_id": voice_id or {"status": "unavailable", "id": "", "score": 0.0},
             "claimed_speaker": claimed_speaker or "", "open_room": bool(open_room),
-            "reply_cap_words": reply_cap_words, "device": device or "", "medium": medium or ""}
+            "reply_cap_words": reply_cap_words, "device": device or "", "medium": medium or "",
+            "target": target or ""}
 
 
 def _display_name(name: str) -> str:
@@ -1603,12 +1616,18 @@ def _frame_for_call(prompt: str, node_id: str, speaker: str, speaker_score) -> s
     return frame_voice_prompt(prompt, node_id, ctx)
 
 
+def _call_target(node_id: str) -> str:
+    """The per-request target carried in this thread's frame context, else the node's target."""
+    ctx = getattr(_FRAME_CTX, "ctx", None) or {}
+    return ctx.get("target") or resolve_target(node_id)
+
+
 def plugin_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
                       speaker_score, timeout: int) -> str:
     if _plugin_brain_call is None:
         raise RuntimeError("no plugin brain")
     wrapped = _frame_for_call(prompt, node_id, speaker, speaker_score)
-    return _plugin_brain_call(resolve_target(node_id), wrapped, timeout)
+    return _plugin_brain_call(_call_target(node_id), wrapped, timeout)
 
 
 # MVG_BRAIN=plugin|http. Default: plugin when the loaded plugin has brain_call, else http.
@@ -1628,7 +1647,7 @@ def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
         "prompt": _frame_for_call(prompt, node_id, speaker, speaker_score),
         "session_id": session_id,
         "node_id": node_id,
-        "target": resolve_target(node_id),
+        "target": _call_target(node_id),
     }).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if MVG_BRAIN_TOKEN:
@@ -1666,7 +1685,7 @@ def plugin_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker
         return reply
     wrapped = _frame_for_call(prompt, node_id, speaker, speaker_score)
     return _plugin_brain_call_stream(
-        resolve_target(node_id), wrapped, timeout, on_partial,
+        _call_target(node_id), wrapped, timeout, on_partial,
         getattr(_STAGE_SINK, "stages", None),
     )
 
@@ -2598,7 +2617,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                "ticks": 0, "first_ms": None}
         gap_enabled = GAP_FILL and stream_mode and opts.get("gap_fill", True)
         spoke = {"state": False, "chunk_idx": 0}
-        target = resolve_target(node_id)
+        target = ctx.get("target") or resolve_target(node_id)
 
         def _mark_speaking() -> bool:
             if voice and not spoke["state"]:
@@ -3066,6 +3085,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
 
         prof = resolve_profile(node_id)
+        requested_target = opt("target")
+        target = resolve_request_target(node_id, requested_target)
         open_room = truthy(opt("open_room"), bool(prof["open_room"]))
         audio_chunk = truthy(opt("audio_chunk"), bool(prof["audio_chunk"]))
         session_id = opt("session_id") or ""
@@ -3184,13 +3205,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         # 5 + 6. Brain, then speak
         ctx = make_frame_ctx(vid, claimed_speaker=claimed, open_room=open_room,
                              reply_cap_words=int(prof["reply_cap_words"]),
-                             device=device, medium=medium)
+                             device=device, medium=medium, target=target)
+        target_extra = {"target_rejected": True} if (
+            requested_target and requested_target != target) else {}
         self._stream_brain_turn(
             t0=t0, turn_id=turn_id, prompt=transcript, session_id=session_id, node_id=node_id,
             speaker=speaker_id, speaker_score=vid.get("score"), ctx=ctx, endpoint="/voice/turn",
             opts={"voice": True, "tts": tts, "gap_fill": bool(prof["gap_fill"]),
                   "audio_chunk": audio_chunk},
-            log_extra={**log_extra, **id_extra, "target": prof["target"]})
+            log_extra={**log_extra, **id_extra, "target": target, **target_extra})
 
     # -- /v1/audio/speech --
 
