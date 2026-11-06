@@ -87,6 +87,7 @@ changing this):
                                 speaker-embedding server (MVG_DESKTOP_EMBED_URL)
                                 over the same ssh reverse tunnel desktop_tts.py
                                 uses.
+    POST /v1/systemone         JSON (Jev /v1/systemone wire protocol) -> JSON; straight proxy to the desktop Laya classifier (MVG_DESKTOP_LAYA_URL) over the ssh reverse tunnel.
     GET  /health                -> {"status": "ok", ...upstream booleans}
 
 TTS fallback chain: a desktop-hosted TTS server reached over an ssh reverse
@@ -583,6 +584,8 @@ FIRST_CLAUSE_EARLY = os.environ.get("MVG_FIRST_CLAUSE_EARLY", "1").strip().lower
 
 DESKTOP_EMBED_URL = os.environ.get("MVG_DESKTOP_EMBED_URL", "http://127.0.0.1:9096/embed")
 DESKTOP_EMBED_TIMEOUT = float(os.environ.get("MVG_DESKTOP_EMBED_TIMEOUT", "4"))
+DESKTOP_LAYA_URL = os.environ.get("MVG_DESKTOP_LAYA_URL", "http://127.0.0.1:9121/v1/systemone")
+DESKTOP_LAYA_TIMEOUT = float(os.environ.get("MVG_DESKTOP_LAYA_TIMEOUT", "20"))
 
 # --- Speaker identification for /ambient (SPEC-011) ------------------------
 # Mirrors the hub's speaker.go FingerprintStore /
@@ -2209,6 +2212,30 @@ def proxy_embed(wav_bytes: bytes) -> tuple[int, bytes]:
         return 502, json.dumps({"error": f"embed upstream unreachable: {exc}"}).encode("utf-8")
 
 
+def proxy_systemone(body: bytes) -> tuple[int, bytes]:
+    """POSTs a Jev /v1/systemone JSON body to DESKTOP_LAYA_URL (the desktop
+    Laya classifier, laya.serve, reached over the same ssh reverse tunnel
+    desktop_tts_speak uses) and returns (status_code, response_body_bytes).
+
+    Callers get the upstream's own status: a 2xx is the classifier's answer,
+    an HTTPError is the upstream's OWN response and is passed through exactly.
+    Only an unreachable upstream (dead tunnel, connection refused, timeout)
+    becomes a 502 from THIS gateway. This is a straight proxy with no retry
+    and no fallback layer; the callers' own layering decides what to do on
+    failure."""
+    req = Request(
+        DESKTOP_LAYA_URL, data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urlopen(req, timeout=DESKTOP_LAYA_TIMEOUT) as resp:
+            return resp.status, resp.read()
+    except HTTPError as exc:
+        return exc.code, exc.read()
+    except Exception as exc:
+        return 502, json.dumps({"error": f"laya upstream unreachable: {exc}"}).encode("utf-8")
+
+
 def _desktop_backend(text: str) -> bytes:
     """desktop_tts_speak() as a chain backend: WAV only. synthesize() calls
     desktop_tts_speak() itself for this entry, to keep the engine label."""
@@ -2595,6 +2622,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._handle_speech()
         if path == "/embed":
             return self._handle_embed()
+        if path == "/v1/systemone":
+            return self._handle_systemone()
         if path == "/voice/pending" and is_defer_enabled():
             return self._handle_pending_post()
         self._send_json(404, {"error": "not found"})
@@ -4195,6 +4224,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
             pass
         outcome = "ok" if status == 200 else f"error:upstream_{status}"
         log_request("/embed", (time.time() - t0) * 1000, outcome, bytes=len(wav_bytes))
+
+    # -- /v1/systemone (Jev wire protocol -> desktop Laya classifier) --
+
+    def _handle_systemone(self):
+        t0 = time.time()
+        body = self._read_body()
+        if not body:
+            self._send_json(400, {"error": "no body"})
+            log_request("/v1/systemone", (time.time() - t0) * 1000, "error:no_body")
+            return
+        status, out = proxy_systemone(body)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        try:
+            self.wfile.write(out)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        outcome = "ok" if status == 200 else f"error:upstream_{status}"
+        log_request("/v1/systemone", (time.time() - t0) * 1000, outcome, bytes=len(body))
 
 
 class Server(ThreadingHTTPServer):
