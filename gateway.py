@@ -3576,7 +3576,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                   "kind": None, "ms": None}
 
         def _maybe_context_opener() -> None:
-            if not opener["on"] or opener["kind"] is not None:
+            if not opener["on"] or opener["kind"] is not None or cancel_event.is_set():
                 return
             if raw_seen or timing["first_audio_ms"] is not None or timing["sentences"]:
                 opener["on"] = False  # the real reply (or other speech) got there first
@@ -3963,7 +3963,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if nothing_queued and not _maybe_gap_fill():
                     client_gone = True
                     break
-                if nothing_queued and progress is not None:
+                if nothing_queued and progress is not None and not cancel_event.is_set():
                     play_end = timing["play_end"]
                     line = progress.next_line(
                         playing=play_end is not None and play_end > time.time(),
