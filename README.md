@@ -476,7 +476,7 @@ rate/channel count — downmixed and resampled to 16kHz mono defensively) →
 `{"embedding": [192 floats], "model": "speechbrain/spkrec-ecapa-voxceleb"}`,
 `GET /health`. The model is loaded once at process start (`_load_model()`),
 followed by one warmup encode, so the first real request doesn't pay for
-CUDA kernel compilation. Runs under the same shared venv as
+CUDA kernel compilation. `MDE_IDLE_UNLOAD_MIN` (float minutes, default `0` = never unload) drops the model after that many idle minutes; the next `/embed` reloads it, and `/health` reports `"status": "idle"` meanwhile. Runs under the same shared venv as
 `desktop_tts.py`, `$MVG_HOME/venvs/chatterbox` (needs `speechbrain` in
 addition to what's already there — confirmed not to touch the installed
 CUDA `torch`/`torchaudio` build). Rejects an empty, undecodable, or

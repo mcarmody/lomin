@@ -31,6 +31,8 @@ requests with while this loads, so there is nothing gained by loading it in
 the background. A single warmup encode runs right after load so the first
 real request doesn't pay for CUDA kernel compilation / lazy allocator
 warmup, which would otherwise risk missing the hub's 500ms post-STT budget.
+With MDE_IDLE_UNLOAD_MIN > 0 the model is dropped after that many idle minutes
+and reloaded by the next /embed.
 
 Honors HF_HUB_OFFLINE=1 once the model is cached locally (same as
 desktop_tts.py's Chatterbox hop) — the first run on a fresh cache needs it
@@ -49,6 +51,7 @@ build). Never the system Python.
 
 from __future__ import annotations
 
+import gc
 import io
 import os
 import sys
@@ -73,20 +76,27 @@ SAVEDIR = Path(
 TARGET_SAMPLE_RATE = 16000
 MIN_DURATION_SEC = 0.5
 WARMUP_SEC = 1.0  # 1s of near-silence, just enough to exercise the full path
+IDLE_UNLOAD_SEC = float(os.environ.get("MDE_IDLE_UNLOAD_MIN", "0") or 0) * 60.0
 
 _model = None
-_model_lock = threading.Lock()
+# RLock: the idle reload runs under the lock, and _load_model() takes it again
+# for the warmup encode.
+_model_lock = threading.RLock()
 _load_error: str | None = None
 _load_ms: float | None = None
 _warmup_ms: float | None = None
 _active_device: str | None = None  # the device _load_model() actually used
+_last_used: float = 0.0  # time.monotonic() of the last finished encode (or load)
+_idle_unloaded: bool = False  # True once the idle watcher dropped the model
 
 
 def _load_model() -> None:
-    """Loads the ECAPA encoder once and runs a warmup encode. Sets
-    _load_error instead of raising, so a bad venv or missing GPU produces a
-    503 from /health rather than crashing the whole process on import."""
-    global _model, _load_error, _load_ms, _warmup_ms, _active_device
+    """Loads the ECAPA encoder and runs a warmup encode. Sets _load_error
+    instead of raising, so a bad venv or missing GPU produces a 503 from
+    /health rather than crashing the whole process on import. Also the reload
+    path after an idle unload."""
+    global _model, _load_error, _load_ms, _warmup_ms, _active_device, _last_used, _idle_unloaded
+    _load_error = None
     try:
         import torch  # noqa: E402 (deliberately lazy: keeps this module
         from speechbrain.inference.speaker import EncoderClassifier  # noqa: E402
@@ -118,9 +128,41 @@ def _load_model() -> None:
         _warmup_ms = (time.time() - t0) * 1000
         print(f"[desktop-embed] warmup encode in {_warmup_ms:.0f}ms", flush=True)
         _model = model
+        _last_used = time.monotonic()
+        _idle_unloaded = False
     except Exception as exc:
         _load_error = f"model load/warmup failed: {exc}"
         print(f"[desktop-embed] {_load_error}", file=sys.stderr, flush=True)
+
+
+def _unload_if_idle(now: float, idle_sec: float) -> bool:
+    """Drops the model once no encode has finished for idle_sec seconds.
+    Returns True when it unloaded. idle_sec <= 0 means disabled."""
+    global _model, _idle_unloaded
+    if idle_sec <= 0:
+        return False
+    with _model_lock:
+        if _model is None:
+            return False
+        if now - _last_used < idle_sec:
+            return False
+        _model = None
+        _idle_unloaded = True
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("[desktop-embed] unloaded after idle", flush=True)
+        return True
+
+
+def _idle_watch() -> None:
+    while True:
+        time.sleep(15)
+        _unload_if_idle(time.monotonic(), IDLE_UNLOAD_SEC)
 
 
 def _decode_and_resample(body: bytes):
@@ -155,17 +197,23 @@ def _decode_and_resample(body: bytes):
 
 def _embed_sync(body: bytes) -> dict:
     """Runs entirely off the event loop (called via run_in_threadpool)."""
+    global _last_used
     import torch
 
-    if _model is None:
-        raise RuntimeError(_load_error or "model not loaded")
-
+    # Decode before the lock and before any reload: a bad body is a 400 and
+    # must not pay for a model load.
     samples = _decode_and_resample(body)
     tensor = torch.from_numpy(samples).unsqueeze(0)  # (1, N)
 
-    t0 = time.time()
     with _model_lock:
-        emb = _model.encode_batch(tensor)
+        if _model is None and _idle_unloaded:
+            _load_model()
+        model = _model
+        if model is None:
+            raise RuntimeError(_load_error or "model not loaded")
+        t0 = time.time()
+        emb = model.encode_batch(tensor)
+        _last_used = time.monotonic()
     ms = (time.time() - t0) * 1000
 
     vector = emb.squeeze(0).squeeze(0).detach().cpu().tolist()
@@ -179,6 +227,20 @@ app = FastAPI()
 @app.get("/health")
 async def health():
     ok = _model is not None
+    idle = _model is None and _idle_unloaded and _load_error is None
+    if idle:
+        return JSONResponse(
+            {
+                "status": "idle",
+                "model": MODEL_ID,
+                "device": _active_device or DEVICE,
+                "loaded": False,
+                "load_error": None,
+                "load_ms": _load_ms,
+                "warmup_ms": _warmup_ms,
+            },
+            status_code=200,
+        )
     return JSONResponse(
         {
             "status": "ok" if ok else "error",
@@ -198,7 +260,7 @@ async def embed(request: Request):
     body = await request.body()
     if not body:
         return JSONResponse({"error": "empty body"}, status_code=400)
-    if _model is None:
+    if _model is None and not _idle_unloaded:
         return JSONResponse({"error": _load_error or "model not loaded"}, status_code=503)
     try:
         result = await run_in_threadpool(_embed_sync, body)
@@ -213,6 +275,8 @@ def main():
     import uvicorn
 
     _load_model()
+    if IDLE_UNLOAD_SEC > 0:
+        threading.Thread(target=_idle_watch, daemon=True).start()
     print(f"[desktop-embed] listening on {BIND}:{PORT}", flush=True)
     uvicorn.run(app, host=BIND, port=PORT, workers=1, log_level="warning")
 
