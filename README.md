@@ -21,20 +21,19 @@ MVG_BRAIN=http MVG_BRAIN_URL=http://127.0.0.1:8000/brain python3 gateway.py
 
 `MVG_PLUGIN` names an importable module that supplies the site-specific parts. Every hook is optional:
 
-| Hook | Signature | Used for |
-|---|---|---|
-| `apply_defaults()` | `-> None` | fill env defaults (`setdefault` only) before the config reads them |
-| `brain_call(target, prompt, timeout)` | `-> str` | the agent answers one framed prompt |
-| `brain_call_stream(target, prompt, timeout, on_partial, stages_out)` | `-> str` | streaming brain: call `on_partial(text_so_far)` as the reply grows. If its signature also takes `task_id` (or `**kwargs`) it gets the turn's task id, the same one `brain_cancel` is called with |
-| `brain_cancel(target, task_id)` | `-> bool` | optional: abort the running brain call with that task id; truthy = it was stopped. Without it, or if it returns falsy or raises, a cancel stops speech and drops the result but cannot stop the brain |
-| `brain_call_stream(target, prompt, timeout, on_partial, stages_out)` | `-> str` | streaming brain: call `on_partial(text_so_far)` as the reply grows. If the signature also takes `audio_clips` (or `**kwargs`) and `MVG_SPLICE_RAW_AUDIO=1`, it gets `audio_clips=[wav_bytes, ...]`: the turn's 16 kHz WAV, so a multimodal brain can hear the original audio. A hook without it is called exactly as before |
-| `talker_instructions(target, node_id)` | `-> str \| None` | optional: return the system instructions for a `/voice/live` Talker session on `node_id` targeting `target`. Checked before the `<MVG_PERSONA_DIR>/<target>/voice_talker.md` and `voice.md` persona files and `MVG_GEMINI_INSTRUCTIONS` / `MVG_TALKER_INSTRUCTIONS` |
-| `classify` | module with `classify_choice(...)` | addressee classifier for `/ambient` and open rooms |
-| `try_intent(text)` | `-> dict \| None` | deterministic fast path; see "Fast path" below |
-| `AMBIENT_LAYA_QUESTION`, `VOICE_ADDRESSED_INSTRUCTIONS` | `str` | replace the addressee classifier's wording, for a site whose classifier was tuned on its own text |
-| `AMBIENT_ADDRESSED` | `str` | the option key the addressee classifier answers with; default `addressed_to_agent` |
+| Hook | Signature | Used for | When missing |
+|---|---|---|---|
+| `apply_defaults()` | `-> None` | fill env defaults (`setdefault` only) before the config reads them | gateway reads env and built-in defaults as-is |
+| `brain_call(target, prompt, timeout)` | `-> str` | the agent answers one framed prompt | `MVG_BRAIN` defaults to `http` (`POST $MVG_BRAIN_URL`) |
+| `brain_call_stream(target, prompt, timeout, on_partial, stages_out, *, task_id=None, audio_clips=None)` | `-> str` | streaming brain: call `on_partial(text_so_far)` as the reply grows; receives `task_id` for cancellation and `audio_clips` (16 kHz WAV bytes) when `MVG_SPLICE_RAW_AUDIO=1` | falls back to single-shot `brain_call` (or `http` streaming when `MVG_BRAIN=http`); omitting `task_id` or `audio_clips` from the signature simply skips passing that keyword |
+| `brain_cancel(target, task_id)` | `-> bool` | optional: abort the running brain call with that task id; truthy = it was stopped | cancel stops speech and drops the result (`"stopped_speech_only"`), but cannot abort the upstream brain call |
+| `talker_instructions(target, node_id)` | `-> str \| None` | optional: return the system instructions for a `/voice/live` Talker session on `node_id` targeting `target` | gateway checks `<MVG_PERSONA_DIR>/<target>/voice_talker.md`, then `voice.md`, then `MVG_GEMINI_INSTRUCTIONS` / `MVG_TALKER_INSTRUCTIONS` |
+| `classify` | module with `classify_choice(...)` | addressee classifier for `/ambient` and open rooms | `/ambient` uses `name-only` matching (engages when the transcript names the agent) |
+| `try_intent(text)` | `-> dict \| None` | deterministic fast path; see "Fast path" below | fast path is skipped (`intent: "miss"`); every turn goes to the brain |
+| `AMBIENT_LAYA_QUESTION`, `VOICE_ADDRESSED_INSTRUCTIONS` | `str` | replace the addressee classifier's wording, for a site whose classifier was tuned on its own text | gateway uses its built-in addressee prompt wording |
+| `AMBIENT_ADDRESSED` | `str` | the option key the addressee classifier answers with; default `addressed_to_agent` | defaults to `"addressed_to_agent"` |
 
-See [`examples/reference_plugin.py`](examples/reference_plugin.py) and [`examples/README.md`](examples/README.md) for a complete, zero-dependency reference plugin implementing `brain_call_stream`, `brain_cancel`, and `talker_instructions`, plus site-specific queue/broker transport patterns.
+See [`examples/reference_plugin.py`](examples/reference_plugin.py) and [`examples/README.md`](examples/README.md) for a complete, zero-dependency reference plugin (in-memory or configurable HTTP via `REF_PLUGIN_BRAIN_URL`) implementing `brain_call_stream`, `brain_cancel`, and `talker_instructions`.
 
 **Cancel.** Each `/voice/turn`, `/ask/stream`, and `/voice/live` (`call_thinker`) brain call gets a 12-character `task_id` and is registered as its node's active task until it ends (success, error or cancel). `gateway.cancel_active_turn(node_id)` returns `"cancelled"` (the `brain_cancel` hook ran and returned truthy), `"stopped_speech_only"` (no hook, or it returned falsy or raised: the turn stops synthesising, drops the result and ends with outcome `cancelled`) or `"no_active_turn"` (nothing running, or already cancelled). With `MVG_SPOKEN_CANCEL=1` a spoken cancel on `/voice/turn` calls it (see below); on `/voice/live` the `cancel_thinker` tool calls it.
 
