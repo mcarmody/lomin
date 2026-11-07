@@ -180,3 +180,35 @@ def test_tts_failure_is_non_fatal():
 def test_no_speak_callable_leaves_text_alone():
     frames = _run_speak([{"type": "text", "text": "hello"}], None)
     assert [f["type"] for f in frames] == ["text"]
+
+
+def test_resume_handle_and_reconnect_dispatch():
+    script = [
+        {"type": "resume_handle", "handle": "h-99"},
+        {"type": "reconnect", "time_left": "3s"},
+        {"type": "text", "text": "still here"},
+        {"type": "turn_end"},
+    ]
+    s, b, frames = asyncio.run(_drive(script, lambda r, t: ""))
+    assert b.reconnected == 1
+    assert ("reconnect",) in b.sent
+    assert s.error is None
+    assert [f["type"] for f in frames] == ["text", "turn_end"]
+
+
+def test_reconnect_failure_ends_session_with_error():
+    async def go():
+        backend = MockBackend([{"type": "reconnect", "time_left": "1s"}, {"type": "text", "text": "unreached"}])
+        backend.reconnect_error = ConnectionError("socket dead")
+        frames = []
+        s = lh.LiveSession(backend, {"node_id": "n1"}, frames.append, lambda r, t: "")
+        await s.open()
+        await s.run()
+        await s.close()
+        return s, backend, frames
+
+    s, b, frames = asyncio.run(go())
+    assert b.reconnected == 1
+    assert s.error == "socket dead"
+    assert s.ended.is_set()
+    assert frames == [{"type": "error", "message": "socket dead"}]

@@ -30,7 +30,7 @@ from talker_backend import TalkerBackend
 
 DEFAULT_URL = ("wss://generativelanguage.googleapis.com/ws/"
                "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
-DEFAULT_MODEL = "gemini-2.5-flash-native-audio-preview"
+DEFAULT_MODEL = "gemini-3.8-live"
 MAX_FRAME = 16 * 1024 * 1024
 
 TOOL_DECLARATIONS = [
@@ -163,21 +163,30 @@ def server_message_events(msg: dict, call_names: dict) -> list[dict]:
             cid = str(fc.get("id") or "")
             call_names[cid] = fc.get("name") or ""
             out.append({"type": "tool_call", "call_id": cid, "name": fc.get("name"), "args": fc.get("args") or {}})
+    sru = msg.get("sessionResumptionUpdate")
+    if isinstance(sru, dict) and sru.get("resumable") and sru.get("newHandle"):
+        out.append({"type": "resume_handle", "handle": str(sru["newHandle"])})
     if "goAway" in msg:
-        out.append({"type": "error", "message": "gemini goAway: " + str((msg.get("goAway") or {}).get("timeLeft", ""))})
+        out.append({"type": "reconnect", "time_left": str((msg.get("goAway") or {}).get("timeLeft", ""))})
     return out
 
 
 class GeminiLiveBackend(TalkerBackend):
-    capabilities = frozenset({"audio_in", "audio_out", "full_duplex", "tool_calls", "silent_context"})
+    capabilities = frozenset({"audio_in", "audio_out", "text_out", "full_duplex", "tool_calls", "silent_context"})
 
     def __init__(self, connect=None):
         self._connect = connect or WSClient.connect  # injectable for tests
         self._ws = None
         self._call_names: dict = {}
         self._closed = False
+        self.resume_handle: str | None = None
+        self._config: dict = {}
 
     async def open(self, config: dict) -> None:
+        self._config = dict(config or {})
+        await self._handshake()
+
+    async def _handshake(self) -> None:
         key = os.environ.get("MVG_GEMINI_API_KEY", "")
         url = os.environ.get("MVG_GEMINI_URL") or DEFAULT_URL
         if not key and "MVG_GEMINI_URL" not in os.environ:
@@ -185,14 +194,20 @@ class GeminiLiveBackend(TalkerBackend):
         if key:
             url += ("&" if "?" in url else "?") + "key=" + key
         model = os.environ.get("MVG_GEMINI_MODEL", DEFAULT_MODEL)
-        gen = {"responseModalities": ["AUDIO"]}
-        voice = os.environ.get("MVG_GEMINI_VOICE")
-        if voice:
-            gen["speechConfig"] = {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}
+        voice_mode = self._config.get("voice_mode") or "native"
+        if voice_mode == "custom_tts":
+            gen = {"responseModalities": ["TEXT"]}
+        else:
+            gen = {"responseModalities": ["AUDIO"]}
+            voice = os.environ.get("MVG_GEMINI_VOICE") or self._config.get("live_voice")
+            if voice:
+                gen["speechConfig"] = {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}
         setup = {"model": model if model.startswith("models/") else f"models/{model}",
                  "generationConfig": gen,
-                 "tools": [{"functionDeclarations": TOOL_DECLARATIONS}]}
-        instr = os.environ.get("MVG_GEMINI_INSTRUCTIONS") or config.get("instructions")
+                 "tools": [{"functionDeclarations": TOOL_DECLARATIONS}],
+                 "contextWindowCompression": {"slidingWindow": {}},
+                 "sessionResumption": {"handle": self.resume_handle} if self.resume_handle else {}}
+        instr = self._config.get("instructions") or os.environ.get("MVG_GEMINI_INSTRUCTIONS")
         if instr:
             setup["systemInstruction"] = {"parts": [{"text": str(instr)}]}
         self._ws = await self._connect(url)
@@ -200,6 +215,12 @@ class GeminiLiveBackend(TalkerBackend):
         first = await self._ws.recv()
         if first is None or "setupComplete" not in _loads(first):
             raise ConnectionError("gemini setup did not complete")
+
+    async def reconnect(self) -> None:
+        if self._ws is not None:
+            await self._ws.close()
+            self._ws = None
+        await self._handshake()
 
     async def send_audio(self, pcm16_16k: bytes) -> None:
         await self._ws.send_json({"realtimeInput": {"audio": {
@@ -221,6 +242,8 @@ class GeminiLiveBackend(TalkerBackend):
                     yield {"type": "error", "message": "gemini connection closed"}
                 return
             for ev in server_message_events(_loads(raw), self._call_names):
+                if ev.get("type") == "resume_handle":
+                    self.resume_handle = ev["handle"]
                 yield ev
 
     async def cancel(self) -> None:

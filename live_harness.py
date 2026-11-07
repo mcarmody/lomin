@@ -243,6 +243,15 @@ class LiveSession:
             await self._speak_text(str(ev.get("text") or ""))
         elif kind in ("audio", "text", "interrupted", "turn_end"):
             await self._client(ev)
+        elif kind == "resume_handle":
+            return True
+        elif kind == "reconnect":
+            try:
+                await self.backend.reconnect()
+            except Exception as exc:  # noqa: BLE001
+                self.error = str(exc) or "reconnect failed"
+                await self._client({"type": "error", "message": self.error})
+                return False
         elif kind == "error":
             self.error = str(ev.get("message") or "backend error")
             await self._client({"type": "error", "message": self.error})

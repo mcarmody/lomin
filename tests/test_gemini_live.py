@@ -103,11 +103,143 @@ def test_setup_and_audio_and_events():
     assert evs[0]["pcm"] == b"\x01\x02"
     r = holder["r"]
     setup = r[0]["setup"]
+    assert setup["model"] == "models/gemini-3.8-live"
     assert setup["generationConfig"]["responseModalities"] == ["AUDIO"]
+    assert setup["contextWindowCompression"] == {"slidingWindow": {}}
+    assert setup["sessionResumption"] == {}
     assert {t["name"] for t in setup["tools"][0]["functionDeclarations"]} == set(
         ["call_thinker", "cancel_thinker", "answer_prompt", "set_progress_updates"])
     assert r[1]["realtimeInput"]["audio"]["mimeType"] == "audio/pcm;rate=16000"
     assert r[2]["toolResponse"]["functionResponses"][0] == {"id": "c1", "name": "call_thinker", "response": {"status": "started"}}
+
+
+def test_default_model_and_instruction_precedence(monkeypatch):
+    assert gl.DEFAULT_MODEL == "gemini-3.8-live"
+    monkeypatch.setenv("MVG_GEMINI_INSTRUCTIONS", "env prompt")
+
+    async def script(reader, writer, received):
+        return None
+
+    async def main():
+        received = []
+
+        async def handle(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            _, data = await _ws_read(reader)
+            received.append(json.loads(data))
+            writer.write(_frame({"setupComplete": {}}))
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setenv("MVG_GEMINI_URL", f"ws://127.0.0.1:{port}/live")
+        monkeypatch.delenv("MVG_GEMINI_API_KEY", raising=False)
+        try:
+            b1 = gl.GeminiLiveBackend()
+            await b1.open({"instructions": "config prompt"})
+            await b1.close()
+
+            b2 = gl.GeminiLiveBackend()
+            await b2.open({})
+            await b2.close()
+        finally:
+            server.close()
+        return received
+
+    received = asyncio.run(main())
+    assert received[0]["setup"]["systemInstruction"] == {"parts": [{"text": "config prompt"}]}
+    assert received[1]["setup"]["systemInstruction"] == {"parts": [{"text": "env prompt"}]}
+
+
+def test_custom_tts_voice_mode_requests_text_modality(monkeypatch):
+    monkeypatch.setenv("MVG_GEMINI_VOICE", "Puck")
+
+    async def main():
+        received = []
+
+        async def handle(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            _, data = await _ws_read(reader)
+            received.append(json.loads(data))
+            writer.write(_frame({"setupComplete": {}}))
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setenv("MVG_GEMINI_URL", f"ws://127.0.0.1:{port}/live")
+        monkeypatch.delenv("MVG_GEMINI_API_KEY", raising=False)
+        try:
+            b = gl.GeminiLiveBackend()
+            await b.open({"voice_mode": "custom_tts"})
+            await b.close()
+        finally:
+            server.close()
+        return received[0]["setup"]
+
+    setup = asyncio.run(main())
+    assert setup["generationConfig"] == {"responseModalities": ["TEXT"]}
+    assert "speechConfig" not in setup["generationConfig"]
+
+
+def test_session_resumption_handle_and_goaway_reconnect(monkeypatch):
+    async def main():
+        received = []
+        conn_count = 0
+
+        async def handle(reader, writer):
+            nonlocal conn_count
+            conn_count += 1
+            c = conn_count
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            _, data = await _ws_read(reader)
+            received.append(json.loads(data))
+            writer.write(_frame({"setupComplete": {}}))
+            await writer.drain()
+            if c == 1:
+                writer.write(_frame({"sessionResumptionUpdate": {"resumable": True, "newHandle": "h-123"}}))
+                writer.write(_frame({"sessionResumptionUpdate": {"resumable": False, "newHandle": "ignored"}}))
+                writer.write(_frame({"goAway": {"timeLeft": "5s"}}))
+            else:
+                writer.write(_frame({"serverContent": {"turnComplete": True}}))
+            await writer.drain()
+            await asyncio.sleep(0.1)
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setenv("MVG_GEMINI_URL", f"ws://127.0.0.1:{port}/live")
+        monkeypatch.delenv("MVG_GEMINI_API_KEY", raising=False)
+        b = gl.GeminiLiveBackend()
+        await b.open({"instructions": "stay sharp"})
+        evs = []
+        try:
+            async for ev in b.events():
+                evs.append(ev)
+                if ev["type"] == "reconnect":
+                    await b.reconnect()
+                elif ev["type"] == "turn_end":
+                    break
+        finally:
+            await b.close()
+            server.close()
+        return b, evs, received
+
+    b, evs, received = asyncio.run(main())
+    assert b.resume_handle == "h-123"
+    assert evs == [
+        {"type": "resume_handle", "handle": "h-123"},
+        {"type": "reconnect", "time_left": "5s"},
+        {"type": "turn_end"},
+    ]
+    assert len(received) == 2
+    assert received[0]["setup"]["sessionResumption"] == {}
+    assert received[1]["setup"]["sessionResumption"] == {"handle": "h-123"}
+    assert received[1]["setup"]["systemInstruction"] == {"parts": [{"text": "stay sharp"}]}
 
 
 def test_silent_text_does_not_complete_turn():
