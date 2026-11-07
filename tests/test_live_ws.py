@@ -215,3 +215,207 @@ def test_open_failure_sends_fallback_then_1011(server, monkeypatch):
     assert fb["event"] == "fallback" and "open_failed" in fb["reason"]
     op, payload = c.recv()
     assert op == live_ws.OP_CLOSE and struct.unpack(">H", payload[:2])[0] == 1011
+
+
+class InspectBackend(EchoBackend):
+    last_instance = None
+
+    def __init__(self):
+        super().__init__()
+        self.opened_with = None
+        InspectBackend.last_instance = self
+
+    async def open(self, config):
+        await super().open(config)
+        self.opened_with = dict(config or {})
+
+
+def test_voice_mode_validation(server, monkeypatch):
+    monkeypatch.setenv("MVG_TALKER_BACKENDS", "inspect=test_live_ws:InspectBackend")
+    monkeypatch.setenv("MVG_TALKER_BACKEND", "inspect")
+
+    # 1. Invalid voice_mode -> 400
+    monkeypatch.setattr(gateway, "resolve_profile", lambda nid: {"target": "agent", "voice_mode": "invalid_mode"})
+    c = Client(server)
+    assert c.status == 400
+    assert "invalid voice_mode: invalid_mode" in c.s.recv(4096).decode()
+    c.s.close()
+
+    # 2. Valid voice_mode: native -> 101 and config carries voice_mode="native"
+    monkeypatch.setattr(gateway, "resolve_profile", lambda nid: {"target": "agent", "voice_mode": "native"})
+    c_nat = Client(server)
+    assert c_nat.status == 101
+    c_nat.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c_nat.recv()
+    assert InspectBackend.last_instance.opened_with["voice_mode"] == "native"
+
+    # 3. Valid voice_mode: custom_tts -> 101 and config carries voice_mode="custom_tts"
+    monkeypatch.setattr(gateway, "resolve_profile", lambda nid: {"target": "agent", "voice_mode": "custom_tts"})
+    c_tts = Client(server)
+    assert c_tts.status == 101
+    c_tts.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c_tts.recv()
+    assert InspectBackend.last_instance.opened_with["voice_mode"] == "custom_tts"
+
+
+def test_talker_instructions_hook_and_persona_fallback(server, monkeypatch, tmp_path):
+    monkeypatch.setenv("MVG_TALKER_BACKENDS", "inspect=test_live_ws:InspectBackend")
+    monkeypatch.setenv("MVG_TALKER_BACKEND", "inspect")
+    monkeypatch.setattr(gateway, "resolve_profile", lambda nid: {"target": "myagent"})
+
+    persona_dir = tmp_path / "personas"
+    agent_dir = persona_dir / "myagent"
+    agent_dir.mkdir(parents=True)
+    monkeypatch.setenv("MVG_PERSONA_DIR", str(persona_dir))
+
+    # 1. voice.md fallback when voice_talker.md does not exist
+    (agent_dir / "voice.md").write_text("  General voice persona  \n", encoding="utf-8")
+    c = Client(server)
+    assert c.status == 101
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c.recv()
+    assert InspectBackend.last_instance.opened_with.get("instructions") == "General voice persona"
+
+    # 2. voice_talker.md takes precedence over voice.md
+    (agent_dir / "voice_talker.md").write_text("  Talker specific persona  \n", encoding="utf-8")
+    c2 = Client(server)
+    assert c2.status == 101
+    c2.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c2.recv()
+    assert InspectBackend.last_instance.opened_with.get("instructions") == "Talker specific persona"
+
+    # 3. _PLUGIN_MOD.talker_instructions hook takes precedence over files
+    class FakePlugin:
+        @staticmethod
+        def talker_instructions(target, node_id):
+            return f"Hook instructions for {target}@{node_id}"
+
+    monkeypatch.setattr(gateway, "_PLUGIN_MOD", FakePlugin)
+    c3 = Client(server)
+    assert c3.status == 101
+    c3.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c3.recv()
+    assert InspectBackend.last_instance.opened_with.get("instructions") == "Hook instructions for myagent@n1"
+
+    # 4. Raising hook falls back to persona file
+    class RaisingPlugin:
+        @staticmethod
+        def talker_instructions(target, node_id):
+            raise RuntimeError("hook failed")
+
+    monkeypatch.setattr(gateway, "_PLUGIN_MOD", RaisingPlugin)
+    c4 = Client(server)
+    assert c4.status == 101
+    c4.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c4.recv()
+    assert InspectBackend.last_instance.opened_with.get("instructions") == "Talker specific persona"
+
+
+class CancelFlowBackend(EchoBackend):
+    brain_started = threading.Event()
+    release_brain = threading.Event()
+    tool_results = []
+
+    def __init__(self):
+        super().__init__()
+        CancelFlowBackend.brain_started.clear()
+        CancelFlowBackend.release_brain.clear()
+        CancelFlowBackend.tool_results = []
+
+    async def open(self, config):
+        await super().open(config)
+        await self.q.put({"type": "tool_call", "call_id": "c1", "name": "call_thinker", "args": {"request": "slow job"}})
+
+    async def send_tool_result(self, call_id, result):
+        await super().send_tool_result(call_id, result)
+        CancelFlowBackend.tool_results.append((call_id, result))
+        if call_id == "c1":
+            import asyncio
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, CancelFlowBackend.brain_started.wait, 5.0)
+            await self.q.put({"type": "tool_call", "call_id": "c2", "name": "cancel_thinker", "args": {}})
+        elif call_id == "c2":
+            CancelFlowBackend.release_brain.set()
+            await self.q.put({"type": "text", "text": "done_cancel", "spoken": True})
+
+
+def test_live_cancel_thinker_reaches_brain_cancel(server, monkeypatch):
+    monkeypatch.setenv("MVG_TALKER_BACKENDS", "cancelflow=test_live_ws:CancelFlowBackend")
+    monkeypatch.setenv("MVG_TALKER_BACKEND", "cancelflow")
+
+    cancelled_calls = []
+    seen_task_ids = []
+
+    def fake_cancel(target, task_id):
+        cancelled_calls.append((target, task_id))
+        return True
+
+    def slow_brain(prompt, session_id, node_id, speaker, score, timeout, on_partial=None, task_id=None, **kw):
+        seen_task_ids.append(task_id)
+        CancelFlowBackend.brain_started.set()
+        CancelFlowBackend.release_brain.wait(5.0)
+        return "finished"
+
+    monkeypatch.setattr(gateway, "_plugin_brain_cancel", fake_cancel)
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", slow_brain)
+
+    c = Client(server)
+    assert c.status == 101
+    op, payload = c.recv()
+    assert op == live_ws.OP_TEXT and json.loads(payload)["text"] == "done_cancel"
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c.recv()
+
+    assert len(cancelled_calls) == 1
+    assert cancelled_calls[0][1] == seen_task_ids[0]
+    assert dict(CancelFlowBackend.tool_results)["c2"]["status"] == "cancelled"
+    assert gateway._ACTIVE_TASKS == {}
+
+
+class StageRelayBackend(EchoBackend):
+    last_instance = None
+
+    def __init__(self):
+        super().__init__()
+        StageRelayBackend.last_instance = self
+
+    async def open(self, config):
+        await super().open(config)
+        await self.q.put({"type": "tool_call", "call_id": "s1", "name": "call_thinker", "args": {"request": "run stages"}})
+
+    async def send_text(self, text, *, silent=False):
+        await super().send_text(text, silent=silent)
+        if text.startswith("[thinker result"):
+            await self.q.put({"type": "text", "text": "all_done", "spoken": True})
+
+
+def test_live_stage_events_produce_two_relay_lines(server, monkeypatch):
+    monkeypatch.setenv("MVG_TALKER_BACKENDS", "stagerelay=test_live_ws:StageRelayBackend")
+    monkeypatch.setenv("MVG_TALKER_BACKEND", "stagerelay")
+    monkeypatch.setenv("MVG_PROGRESS_MIN_GAP_SEC", "0")
+
+    import time
+
+    def stage_brain(prompt, session_id, node_id, speaker, score, timeout, on_partial=None, stages_out=None, **kw):
+        sink = stages_out if stages_out is not None else getattr(gateway._STAGE_SINK, "stages", None)
+        sink.setdefault("events", []).append({"stage": "tool_start", "detail": "step one", "t": 1.0})
+        time.sleep(0.05)
+        sink.setdefault("events", []).append({"stage": "milestone", "detail": "step two", "t": 2.0})
+        time.sleep(0.05)
+        return "final answer"
+
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", stage_brain)
+
+    c = Client(server)
+    assert c.status == 101
+    op, payload = c.recv()
+    assert op == live_ws.OP_TEXT and json.loads(payload)["text"] == "all_done"
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c.recv()
+
+    sent_texts = [(x[1], x[2]) for x in StageRelayBackend.last_instance.sent if x[0] == "text"]
+    progress_lines = [(t, silent) for t, silent in sent_texts if t.startswith("[task progress]")]
+    assert progress_lines == [
+        ("[task progress] step one", True),
+        ("[task progress] step two", True),
+    ]

@@ -242,9 +242,11 @@ if PLUGIN_NAME:
               file=sys.stderr)
 if _plugin is not None and hasattr(_plugin, "apply_defaults"):
     _plugin.apply_defaults()
+_PLUGIN_MOD = _plugin
 _plugin_brain_call = getattr(_plugin, "brain_call", None)
 _plugin_brain_call_stream = getattr(_plugin, "brain_call_stream", None)
 _plugin_brain_cancel = getattr(_plugin, "brain_cancel", None)
+_plugin_talker_instructions = getattr(_plugin, "talker_instructions", None)
 # Kept as `_jev_classifier`: test_ambient.py monkeypatches its attributes.
 _jev_classifier = getattr(_plugin, "classify", None)
 _try_intent = getattr(_plugin, "try_intent", None) or (lambda text: None)
@@ -2167,8 +2169,8 @@ _ACTIVE_TASKS: dict = {}
 _ACTIVE_TASKS_LOCK = threading.Lock()
 
 
-def _register_task(node_id: str, target: str) -> dict:
-    task = {"task_id": uuid.uuid4().hex[:12], "target": target, "started": time.time(),
+def _register_task(node_id: str, target: str, task_id: str | None = None) -> dict:
+    task = {"task_id": task_id or uuid.uuid4().hex[:12], "target": target, "started": time.time(),
             "cancel_event": threading.Event(), "wake": None}
     with _ACTIVE_TASKS_LOCK:
         _ACTIVE_TASKS[node_id or ""] = task
@@ -2179,6 +2181,42 @@ def _unregister_task(node_id: str, task: dict) -> None:
     with _ACTIVE_TASKS_LOCK:
         if _ACTIVE_TASKS.get(node_id or "") is task:
             del _ACTIVE_TASKS[node_id or ""]
+
+
+def _resolve_talker_instructions(target: str, node_id: str) -> str | None:
+    """Resolve system instructions for a live Talker session.
+
+    Checks the plugin's `talker_instructions(target, node_id)` hook first, then
+    falls back to `<MVG_PERSONA_DIR>/<target>/voice_talker.md` followed by
+    `<MVG_PERSONA_DIR>/<target>/voice.md`."""
+    hook = _plugin_talker_instructions
+    if hook is None:
+        for mod in (_PLUGIN_MOD, _plugin):
+            if mod is not None:
+                hook = getattr(mod, "talker_instructions", None)
+                if callable(hook):
+                    break
+    if callable(hook):
+        try:
+            res = hook(target, node_id)
+            if isinstance(res, str) and res.strip():
+                return res.strip()
+        except Exception:
+            pass
+    persona_dir = os.environ.get("MVG_PERSONA_DIR", "").strip()
+    target_clean = (target or "").strip()
+    if persona_dir and target_clean and "/" not in target_clean and "\\" not in target_clean and ".." not in target_clean and target_clean != ".":
+        base = Path(persona_dir) / target_clean
+        for filename in ("voice_talker.md", "voice.md"):
+            p = base / filename
+            try:
+                if p.is_file():
+                    text = p.read_text(encoding="utf-8").strip()
+                    if text:
+                        return text
+            except OSError:
+                continue
+    return None
 
 
 def cancel_active_turn(node_id: str) -> str:
@@ -4443,13 +4481,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
     # -- /voice/live (WebSocket, live_ws.py) --
 
     def _handle_voice_live(self):
+        import asyncio
         import live_ws
         t0 = time.time()
         qs = parse_qs(urlsplit(self.path).query)
         node_id = ((qs.get("node_id") or [""])[0] or self.headers.get("X-Node-Id") or "").strip()
         if not self._check_bearer_auth(node_id, "/voice/live", t0):
             return
-        backend_name = (resolve_profile(node_id).get("talker_backend")
+        profile = resolve_profile(node_id)
+        voice_mode = str(profile.get("voice_mode") or "native").strip()
+        if voice_mode not in ("native", "custom_tts"):
+            self._send_json(400, {"error": f"invalid voice_mode: {voice_mode} (expected native or custom_tts)"})
+            log_request("/voice/live", (time.time() - t0) * 1000, "error:bad_voice_mode", node=node_id)
+            return
+        backend_name = (profile.get("talker_backend")
                         or os.environ.get("MVG_TALKER_BACKEND", "")).strip()
         if not backend_name:
             self._send_json(501, {"error": "live voice is not configured: set MVG_TALKER_BACKEND "
@@ -4476,15 +4521,107 @@ class GatewayHandler(BaseHTTPRequestHandler):
         ws = live_ws.WSConn(self.connection, live_ws._env_num("MVG_LIVE_MAX_FRAME", "262144", int))
         target = resolve_request_target(node_id, None)
         session_id = f"live-{uuid.uuid4().hex[:8]}"
+        instr = _resolve_talker_instructions(target, node_id)
+        session_holder: dict = {}
+        session_loop: list = [None]
+        default_brain_call = http_brain_call if MVG_BRAIN == "http" else plugin_brain_call
+
+        class _LiveEventList(list):
+            def __init__(self, on_event):
+                super().__init__()
+                self._on_event = on_event
+
+            def append(self, item):
+                super().append(item)
+                self._on_event(item)
+
+            def extend(self, items):
+                for item in items:
+                    self.append(item)
+
+        class _LiveStageSink(dict):
+            def __init__(self, on_event):
+                super().__init__()
+                self._on_event = on_event
+                super().__setitem__("events", _LiveEventList(on_event))
+
+            def __setitem__(self, key, val):
+                if key == "events" and isinstance(val, list) and not isinstance(val, _LiveEventList):
+                    el = _LiveEventList(self._on_event)
+                    for item in val:
+                        el.append(item)
+                    val = el
+                super().__setitem__(key, val)
+
+            def setdefault(self, key, default=None):
+                if key not in self:
+                    self[key] = default
+                return self[key]
+
+            def append(self, item):
+                self["events"].append(item)
+
+        def _forward_stage_event(ev):
+            norm = normalize_stage_event(ev)
+            sess = session_holder.get("session")
+            loop = session_loop[0]
+            if norm and sess is not None and loop is not None and not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(asyncio.ensure_future, sess.on_stage_event(norm))
+                except RuntimeError:
+                    pass
 
         def brain(request, task_id):
-            return BRAIN_CALL(request, session_id, node_id, "", None, HIVE_TIMEOUT)
+            task = _register_task(node_id, target, task_id=task_id)
+            tid = task["task_id"]
+            stages_out = _LiveStageSink(_forward_stage_event)
+            _STAGE_SINK.stages = stages_out
+            try:
+                use_stream = (
+                    BRAIN_CALL is default_brain_call
+                    and (
+                        STREAM_BRAIN_CALL is not plugin_brain_call_stream
+                        or _plugin_brain_call_stream is not None
+                    )
+                )
+                if use_stream:
+                    call_kwargs = {"task_id": tid, "stages_out": stages_out}
+                    try:
+                        params = inspect.signature(STREAM_BRAIN_CALL).parameters
+                        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                        filtered = {k: v for k, v in call_kwargs.items() if has_var_kw or k in params}
+                    except (ValueError, TypeError):
+                        filtered = {}
+                    return STREAM_BRAIN_CALL(
+                        request, session_id, node_id, "", None, HIVE_TIMEOUT,
+                        lambda _partial: None, **filtered,
+                    )
+                call_kwargs = {"task_id": tid, "stages_out": stages_out}
+                try:
+                    params = inspect.signature(BRAIN_CALL).parameters
+                    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                    filtered = {k: v for k, v in call_kwargs.items() if has_var_kw or k in params}
+                except (ValueError, TypeError):
+                    filtered = {}
+                return BRAIN_CALL(request, session_id, node_id, "", None, HIVE_TIMEOUT, **filtered)
+            finally:
+                _STAGE_SINK.stages = None
+                _unregister_task(node_id, task)
 
         def factory(send_to_client):
-            return live_harness.LiveSession(
-                backend_cls(), {"node_id": node_id, "target": target}, send_to_client, brain,
+            try:
+                session_loop[0] = asyncio.get_running_loop()
+            except RuntimeError:
+                session_loop[0] = None
+            cfg = {"node_id": node_id, "target": target, "voice_mode": voice_mode}
+            if instr:
+                cfg["instructions"] = instr
+            sess = live_harness.LiveSession(
+                backend_cls(), cfg, send_to_client, brain,
                 getattr(sys.modules[__name__], "cancel_active_turn", None),
                 lambda text: synthesize(text)[0])
+            session_holder["session"] = sess
+            return sess
         outcome = live_ws.run_live_session(ws, factory)
         log_request("/voice/live", (time.time() - t0) * 1000, outcome, node=node_id, backend=backend_name)
 
