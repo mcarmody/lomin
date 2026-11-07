@@ -263,6 +263,8 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_STT_CACHE_TTL_SEC` | `60` |
 | `MVG_DESKTOP_EMBED_URL` | `http://127.0.0.1:9096/embed` |
 | `MVG_DESKTOP_EMBED_TIMEOUT` | `4` (seconds) |
+| `MVG_DESKTOP_LAYA_URL` | `http://127.0.0.1:9121/v1/systemone` |
+| `MVG_DESKTOP_LAYA_TIMEOUT` | `20` (seconds) |
 | `MVG_SPEAKERS_PATH` | `$MVG_HOME/speakers.json` |
 | `MVG_SPEAKER_THRESHOLD` | `0.70` |
 | `MVG_SPEAKER_ID` | `1` — `0` turns speaker identification off on every node (`identify` false in `resolve_profile`) |
@@ -309,6 +311,7 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `POST /ask/stream` | Same JSON request as `/ask` → `text/event-stream` (`status`*, `sentence`*, `reply`, `done`). Returns HTTP 400 on invalid JSON. | `brain_call_stream()` — speaks each sentence as soon as it's complete; see "MANDOS streaming" below |
 | `POST /v1/audio/speech` | OpenAI-compatible JSON `{model, input, voice, response_format}` → **always 24 kHz mono 16-bit WAV bytes** (`response_format` is accepted but ignored for the actual audio — the edge client plays with `aplay -`, which cannot decode mp3). Long inputs are sentence-chunked and synthesized in parallel (`synthesize_chunked`); see "Every audio payload is 24 kHz mono 16-bit WAV" below. | desktop Chatterbox -> desktop Piper -> local Piper |
 | `POST /embed` | raw WAV body → `{"embedding": [...], "model": "..."}`, straight proxy to the desktop's speaker-embedding server | `MVG_DESKTOP_EMBED_URL` — see "Speaker ID" below |
+| `POST /v1/systemone` | JSON → JSON, straight proxy to the desktop Laya classifier | `MVG_DESKTOP_LAYA_URL` |
 | `POST /intent` | JSON `{text, speaker, node, turn_id}` -> `204` (no match) or the same `text/event-stream` as `/ask/stream`. LAMMAS, see below. | `lammas.py` |
 | `GET /health` | → `{"status": "ok", "upstreams": {...}}` | — |
 
@@ -508,7 +511,7 @@ rate/channel count — downmixed and resampled to 16kHz mono defensively) →
 `{"embedding": [192 floats], "model": "speechbrain/spkrec-ecapa-voxceleb"}`,
 `GET /health`. The model is loaded once at process start (`_load_model()`),
 followed by one warmup encode, so the first real request doesn't pay for
-CUDA kernel compilation. Runs under the same shared venv as
+CUDA kernel compilation. `MDE_IDLE_UNLOAD_MIN` (float minutes, default `0` = never unload) drops the model after that many idle minutes; the next `/embed` reloads it, and `/health` reports `"status": "idle"` meanwhile. Runs under the same shared venv as
 `desktop_tts.py`, `$MVG_HOME/venvs/chatterbox` (needs `speechbrain` in
 addition to what's already there — confirmed not to touch the installed
 CUDA `torch`/`torchaudio` build). Rejects an empty, undecodable, or
