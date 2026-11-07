@@ -82,3 +82,20 @@ def test_off_by_default(gw, fake_tts, monkeypatch, tmp_path):
     events = _run(gw)
     assert not any("One moment" in d["text"] for d in _sentences(events))
     assert "opener_kind" not in _latency(tmp_path)[-1]
+
+
+def test_cancelled_turn_suppresses_context_opener(gw, fake_tts, monkeypatch, tmp_path):
+    monkeypatch.setenv("MVG_CONTEXT_OPENER", "1")
+
+    def brain(prompt, session_id, node_id, speaker, score, timeout, on_partial):
+        assert gateway.cancel_active_turn(node_id) in ("cancelled", "stopped_speech_only")
+        gateway._STAGE_SINK.stages.setdefault("events", []).append(
+            {"stage": "tool_start", "detail": "checking the build logs", "t": 0.05}
+        )
+        time.sleep(0.2)
+        return ""
+
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", brain)
+    events = _run(gw)
+    assert not any("One moment" in d.get("text", "") for d in _sentences(events))
+    assert _latency(tmp_path)[-1].get("opener_kind") != "stage"
