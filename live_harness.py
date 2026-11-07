@@ -20,10 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import os
+import struct
 import time
 import uuid
 from typing import Any, Callable
+
+from sentence_segmenter import SentenceSegmenter
 
 MAX_REQUEST_CHARS = 4000
 TOOL_NAMES = ("call_thinker", "cancel_thinker", "answer_prompt", "set_progress_updates")
@@ -160,10 +164,16 @@ class ProgressRelay:
 
 class LiveSession:
     def __init__(self, backend, config: dict, send_to_client: Callable, brain_call: Callable,
-                 cancel_turn: Callable | None = None, speak: Callable | None = None):
+                 cancel_turn: Callable | None = None, speak: Callable | None = None,
+                 transcribe: Callable[[bytes], str] | None = None):
         self.backend = backend
         # speak(text) -> WAV bytes (the gateway TTS chain). Used for text-out replies.
         self._speak = speak
+        self._transcribe = transcribe
+        self._segmenter = SentenceSegmenter()
+        self._audio_buf = bytearray()
+        self._voiced_ms = 0.0
+        self._silence_ms = 0.0
         self.config = dict(config or {})
         self.node_id = str(self.config.get("node_id") or "")
         self._send_to_client = send_to_client
@@ -194,9 +204,61 @@ class LiveSession:
         await self.backend.open(self.config)
         self._worker = asyncio.ensure_future(self._work())
 
+    async def feed_text(self, text: str, *, silent: bool = False) -> None:
+        if not self._closed and isinstance(text, str) and text.strip():
+            await self.backend.send_text(text, silent=silent)
+
     async def feed_audio(self, pcm16_16k: bytes) -> None:
-        if not self._closed:
+        if self._closed or not pcm16_16k:
+            return
+        if "audio_in" in getattr(self.backend, "capabilities", frozenset()):
             await self.backend.send_audio(pcm16_16k)
+            return
+        self._audio_buf.extend(pcm16_16k)
+        n = len(pcm16_16k) // 2
+        if n == 0:
+            return
+        samples = struct.unpack(f"<{n}h", pcm16_16k[:n * 2])
+        rms = math.sqrt(sum(s * s for s in samples) / n)
+        dur_ms = n / 16.0
+        if rms >= 300.0:
+            self._voiced_ms += dur_ms
+            self._silence_ms = 0.0
+        elif self._voiced_ms >= 200.0:
+            self._silence_ms += dur_ms
+            if self._silence_ms >= 600.0:
+                await self.flush_audio()
+
+    async def flush_audio(self) -> str | None:
+        if self._closed or not self._audio_buf:
+            self._audio_buf.clear()
+            self._voiced_ms = 0.0
+            self._silence_ms = 0.0
+            return None
+        pcm = bytes(self._audio_buf)
+        self._audio_buf.clear()
+        self._voiced_ms = 0.0
+        self._silence_ms = 0.0
+        fn = self._transcribe
+        if fn is None:
+            try:
+                from gateway import transcribe as fn
+            except Exception as exc:  # noqa: BLE001
+                await self._client({"type": "tts_error", "message": f"stt failed: {exc}"[:200]})
+                return None
+        try:
+            import audio_utils
+            wav = audio_utils.pcm_to_wav(pcm, 16000)
+            loop = asyncio.get_running_loop()
+            raw_text = await loop.run_in_executor(None, fn, wav)
+        except Exception as exc:  # noqa: BLE001
+            await self._client({"type": "tts_error", "message": f"stt failed: {exc}"[:200]})
+            return None
+        transcript = (raw_text or "").strip()
+        if transcript:
+            await self.backend.send_text(transcript, silent=False)
+            return transcript
+        return None
 
     async def run(self) -> None:
         """Consume backend events until they end, an error event arrives, or close()."""
@@ -206,13 +268,25 @@ class LiveSession:
                     break
                 if not await self._dispatch(ev):
                     break
+            if not self._closed and self.error is None:
+                await self._flush_speech()
         finally:
             self.ended.set()
+
+    async def _flush_speech(self) -> None:
+        if self._speak is not None:
+            tail = self._segmenter.flush()
+            if tail:
+                await self._speak_text(tail)
+
+    def _clear_speech(self) -> None:
+        self._segmenter.flush()
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._clear_speech()
         self.relay.close()
         if self._worker is not None:
             self._worker.cancel()
@@ -236,12 +310,20 @@ class LiveSession:
         """False ends the session."""
         kind = ev.get("type") if isinstance(ev, dict) else None
         if kind == "tool_call":
+            await self._flush_speech()
             result = await self._handle_tool(ev.get("name"), ev.get("args"))
             await self.backend.send_tool_result(str(ev.get("call_id") or ""), result)
         elif kind == "text" and self._speak is not None and not ev.get("spoken"):
             await self._client(ev)
-            await self._speak_text(str(ev.get("text") or ""))
-        elif kind in ("audio", "text", "interrupted", "turn_end"):
+            for sentence in self._segmenter.feed(str(ev.get("text") or "")):
+                await self._speak_text(sentence)
+        elif kind == "turn_end":
+            await self._flush_speech()
+            await self._client(ev)
+        elif kind == "interrupted":
+            self._clear_speech()
+            await self._client(ev)
+        elif kind in ("audio", "text"):
             await self._client(ev)
         elif kind == "resume_handle":
             return True

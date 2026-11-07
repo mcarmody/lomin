@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import live_harness as lh  # noqa: E402
-from talker_backend import MockBackend  # noqa: E402
+from talker_backend import CascadedTextBackend, MockBackend  # noqa: E402
 
 
 def call(cid, name, args):
@@ -212,3 +212,100 @@ def test_reconnect_failure_ends_session_with_error():
     assert s.error == "socket dead"
     assert s.ended.is_set()
     assert frames == [{"type": "error", "message": "socket dead"}]
+
+
+def test_streaming_text_deltas_buffered_by_sentence_segmenter():
+    spoken = []
+
+    def speak(text):
+        spoken.append(text)
+        return _wav()
+
+    script = [
+        {"type": "text", "text": "Hello "},
+        {"type": "text", "text": "world. "},
+        {"type": "text", "text": "Next "},
+        {"type": "text", "text": "line."},
+        {"type": "turn_end"},
+    ]
+    frames = _run_speak(script, speak)
+
+    received_texts = [f["text"] for f in frames if f["type"] == "text"]
+    assert received_texts == ["Hello ", "world. ", "Next ", "line."]
+    assert spoken == ["Hello world.", "Next line."]
+    assert [f["type"] for f in frames] == ["text", "text", "audio", "text", "text", "audio", "turn_end"]
+
+
+def test_interrupted_discards_buffered_unspoken_text():
+    spoken = []
+
+    def speak(text):
+        spoken.append(text)
+        return _wav()
+
+    script = [
+        {"type": "text", "text": "Partial unfin"},
+        {"type": "interrupted"},
+        {"type": "text", "text": "Fresh reply."},
+        {"type": "turn_end"},
+    ]
+    frames = _run_speak(script, speak)
+    assert spoken == ["Fresh reply."]
+    assert [f["type"] for f in frames] == ["text", "interrupted", "text", "audio", "turn_end"]
+
+
+def test_cascaded_session_audio_stt_and_feed_text():
+    transcribed_wavs = []
+
+    def fake_transcribe(wav):
+        transcribed_wavs.append(wav)
+        return "check status"
+
+    def brain(req, tid):
+        return f"status normal: {req}"
+
+    backend = CascadedTextBackend()
+    frames = []
+
+    async def go():
+        s = lh.LiveSession(
+            backend,
+            {"node_id": "n1"},
+            frames.append,
+            brain,
+            speak=lambda t: _wav(),
+            transcribe=fake_transcribe,
+        )
+        await s.open()
+        run_task = asyncio.create_task(s.run())
+
+        # Voiced PCM16 16kHz frames (4000 samples = 250 ms)
+        voiced = b"\x00\x10" * 4000
+        await s.feed_audio(voiced)
+
+        # Silence (11200 samples = 700 ms, triggers silence >= 600ms)
+        silence = b"\x00\x00" * 11200
+        await s.feed_audio(silence)
+
+        # Wait until thinker result arrives and is synthesized
+        for _ in range(50):
+            if any(f.get("type") == "text" and "status normal" in f.get("text", "") for f in frames):
+                break
+            await asyncio.sleep(0.05)
+
+        # Verify feed_text directly
+        await s.feed_text("hello")
+        await asyncio.sleep(0.05)
+
+        await s.close()
+        await run_task
+
+    asyncio.run(go())
+
+    assert len(transcribed_wavs) == 1
+    assert transcribed_wavs[0].startswith(b"RIFF")
+
+    texts_seen = [f.get("text") for f in frames if f.get("type") == "text"]
+    assert "On it." in texts_seen
+    assert any("status normal: check status" in (t or "") for t in texts_seen)
+    assert any(m.get("content") == "hello" for m in backend.messages)

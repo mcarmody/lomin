@@ -215,8 +215,9 @@ class CascadedTextBackend(TalkerBackend):
             url = (self._config.get("talker_url") or os.environ.get("MVG_TALKER_URL") or "").strip()
             if url:
                 loop = asyncio.get_running_loop()
-                res = await loop.run_in_executor(None, self._http_chat, url)
-                await self._emit_response(res)
+                res = await loop.run_in_executor(None, self._http_chat_stream, url, loop)
+                if res is not None:
+                    await self._emit_response(res)
                 return
             # Built-in local cascaded behavior when no external HTTP endpoint is configured:
             if latest_text.startswith("[thinker result,"):
@@ -282,6 +283,123 @@ class CascadedTextBackend(TalkerBackend):
                         "args": tc.get("args") or {},
                     })
             await self._queue.put({"type": "turn_end"})
+
+    def _http_chat_stream(self, url: str, loop: asyncio.AbstractEventLoop | None = None) -> dict | None:
+        model = (self._config.get("talker_model") or os.environ.get("MVG_TALKER_MODEL") or "gpt-4o-mini").strip()
+        key = (self._config.get("talker_key") or os.environ.get("MVG_TALKER_KEY") or "").strip()
+        timeout = float(os.environ.get("MVG_TALKER_TIMEOUT", "15"))
+        stream_conf = self._config.get("stream")
+        stream_enabled = True if stream_conf is None else (
+            stream_conf.lower() not in ("0", "false", "no") if isinstance(stream_conf, str) else bool(stream_conf)
+        )
+        payload = json.dumps({
+            "model": model,
+            "messages": list(self.messages),
+            "tools": CASCADED_TOOLS,
+            "stream": stream_enabled,
+        }).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream, application/json",
+        }
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+        def enqueue(item: dict) -> None:
+            if loop is not None and loop.is_running():
+                try:
+                    loop.call_soon_threadsafe(self._queue.put_nowait, item)
+                except RuntimeError:
+                    pass
+            else:
+                try:
+                    self._queue.put_nowait(item)
+                except Exception:
+                    pass
+
+        emitted_any = False
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                req = Request(url, data=payload, headers=headers, method="POST")
+                with urlopen(req, timeout=timeout) as resp:
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    if "text/event-stream" in ctype and stream_enabled:
+                        full_text_parts: list[str] = []
+                        tool_calls_acc: dict[int, dict[str, str]] = {}
+                        for raw_line in resp:
+                            if self.closed:
+                                break
+                            line = raw_line.decode("utf-8").strip("\r\n")
+                            if not line or line.startswith(":"):
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                            except ValueError:
+                                continue
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta") or {}
+                            if delta.get("content"):
+                                piece = str(delta["content"])
+                                full_text_parts.append(piece)
+                                emitted_any = True
+                                enqueue({"type": "text", "text": piece, "spoken": False})
+                            if delta.get("tool_calls"):
+                                for tc in delta["tool_calls"]:
+                                    idx = int(tc.get("index", 0))
+                                    if idx not in tool_calls_acc:
+                                        tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                                    if tc.get("id"):
+                                        tool_calls_acc[idx]["id"] = str(tc["id"])
+                                    fn = tc.get("function") or {}
+                                    if fn.get("name"):
+                                        tool_calls_acc[idx]["name"] = str(fn["name"])
+                                    if fn.get("arguments"):
+                                        tool_calls_acc[idx]["arguments"] += str(fn["arguments"])
+                        if not self.closed:
+                            full_text = "".join(full_text_parts)
+                            cleaned = _clean_spoken_text(full_text)
+                            if cleaned:
+                                self.messages.append({"role": "assistant", "content": cleaned})
+                            for idx in sorted(tool_calls_acc):
+                                tc = tool_calls_acc[idx]
+                                raw_args = tc["arguments"]
+                                try:
+                                    args = json.loads(raw_args) if raw_args else {}
+                                except ValueError:
+                                    args = {}
+                                call_id = tc["id"] or f"call_{idx + 1}"
+                                enqueue({
+                                    "type": "tool_call",
+                                    "call_id": call_id,
+                                    "name": tc["name"],
+                                    "args": args,
+                                })
+                            enqueue({"type": "turn_end"})
+                        return None
+                    else:
+                        body = json.loads(resp.read().decode("utf-8"))
+                        choice = ((body.get("choices") or [{}])[0]).get("message") or {}
+                        return {
+                            "text": choice.get("content") or "",
+                            "tool_calls": choice.get("tool_calls") or [],
+                        }
+            except HTTPError as exc:
+                last_err = exc
+                if exc.code >= 500 and attempt == 0 and not emitted_any:
+                    continue
+                raise
+            except (URLError, TimeoutError, ValueError) as exc:
+                last_err = exc
+                raise
+        raise RuntimeError(str(last_err or "cascaded talker request failed"))
 
     def _http_chat(self, url: str) -> dict:
         model = (self._config.get("talker_model") or os.environ.get("MVG_TALKER_MODEL") or "gpt-4o-mini").strip()

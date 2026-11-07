@@ -1,7 +1,11 @@
 """TalkerBackend contract, MockBackend and load_backend."""
 import asyncio
+import json
 import sys
+import threading
+import time
 import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -137,3 +141,235 @@ def test_unknown_and_broken_plugin(monkeypatch):
 def test_base_class_methods_not_implemented():
     with pytest.raises(NotImplementedError):
         run(tb.TalkerBackend().open({}))
+
+
+def test_cascaded_http_sse_streaming():
+    requests_received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            requests_received.append(json.loads(body))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            chunks = [
+                'data: {"choices": [{"delta": {"content": "Hello "}}]}\n\n',
+                'data: {"choices": [{"delta": {"content": "world!"}}]}\n\n',
+                'data: [DONE]\n\n',
+            ]
+            for c in chunks:
+                self.wfile.write(c.encode("utf-8"))
+                self.wfile.flush()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    try:
+        b = tb.CascadedTextBackend()
+
+        async def go():
+            await b.open({"talker_url": f"http://127.0.0.1:{port}/chat"})
+            await b.send_text("Greetings")
+            evs = []
+            async for ev in b.events():
+                evs.append(ev)
+                if ev["type"] == "turn_end":
+                    break
+            await b.close()
+            return evs
+
+        evs = run(go())
+        assert [e["type"] for e in evs] == ["text", "text", "turn_end"]
+        assert [e["text"] for e in evs if e["type"] == "text"] == ["Hello ", "world!"]
+        assert b.messages[-1] == {"role": "assistant", "content": "Hello world!"}
+        assert len(requests_received) == 1
+        assert requests_received[0]["messages"][-1] == {"role": "user", "content": "Greetings"}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cascaded_http_json_tool_call_and_followup():
+    requests_received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            data = json.loads(body)
+            requests_received.append(data)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if len(requests_received) == 1:
+                resp = {
+                    "choices": [{
+                        "message": {
+                            "content": "Checking temperature.",
+                            "tool_calls": [{
+                                "id": "tc_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "call_thinker",
+                                    "arguments": json.dumps({"request": "get temp"}),
+                                },
+                            }],
+                        }
+                    }]
+                }
+            else:
+                resp = {
+                    "choices": [{
+                        "message": {
+                            "content": "It is currently 72 degrees.",
+                        }
+                    }]
+                }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    try:
+        b = tb.CascadedTextBackend()
+
+        async def go():
+            await b.open({"talker_url": f"http://127.0.0.1:{port}/chat"})
+            await b.send_text("What is the temperature?")
+            evs_1 = []
+            async for ev in b.events():
+                evs_1.append(ev)
+                if ev["type"] == "turn_end":
+                    break
+            # Caller invokes send_tool_result and follow-up send_text
+            await b.send_tool_result("tc_1", {"status": "started", "handoff_id": 1})
+            await b.send_text("[thinker result, handoff #1] It is 72 degrees.")
+            evs_2 = []
+            async for ev in b.events():
+                evs_2.append(ev)
+                if ev["type"] == "turn_end":
+                    break
+            await b.close()
+            return evs_1, evs_2
+
+        evs_1, evs_2 = run(go())
+        assert [e["type"] for e in evs_1] == ["text", "tool_call", "turn_end"]
+        assert evs_1[0]["text"] == "Checking temperature."
+        assert evs_1[1]["name"] == "call_thinker"
+        assert evs_1[1]["args"] == {"request": "get temp"}
+
+        assert [e["type"] for e in evs_2] == ["text", "turn_end"]
+        assert evs_2[0]["text"] == "It is currently 72 degrees."
+
+        assert len(requests_received) == 2
+        req2_msgs = requests_received[1]["messages"]
+        assert any(m.get("role") == "tool" and m.get("tool_call_id") == "tc_1" for m in req2_msgs)
+        assert any("[thinker result, handoff #1] It is 72 degrees." in m.get("content", "") for m in req2_msgs)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cascaded_http_5xx_retry_and_4xx_error(monkeypatch):
+    req_count = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            nonlocal req_count
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            if self.path == "/retry":
+                req_count += 1
+                if req_count == 1:
+                    self.send_response(502)
+                    self.end_headers()
+                    self.wfile.write(b"Bad Gateway")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"choices": [{"message": {"content": "Recovered"}}]}).encode("utf-8"))
+            elif self.path == "/auth_fail":
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"Unauthorized")
+            elif self.path == "/slow":
+                time.sleep(0.5)
+                self.send_response(200)
+                self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    try:
+        # 1. 502 on request 1, 200 on request 2 (succeeds on retry)
+        b = tb.CascadedTextBackend()
+
+        async def go_retry():
+            await b.open({"talker_url": f"http://127.0.0.1:{port}/retry"})
+            await b.send_text("retry test")
+            evs = []
+            async for ev in b.events():
+                evs.append(ev)
+                if ev["type"] == "turn_end":
+                    break
+            await b.close()
+            return evs
+
+        evs = run(go_retry())
+        assert req_count == 2
+        assert [e["type"] for e in evs] == ["text", "turn_end"]
+        assert evs[0]["text"] == "Recovered"
+
+        # 2. 401 error
+        b401 = tb.CascadedTextBackend()
+
+        async def go_401():
+            await b401.open({"talker_url": f"http://127.0.0.1:{port}/auth_fail"})
+            await b401.send_text("401 test")
+            evs = []
+            async for ev in b401.events():
+                evs.append(ev)
+                if ev["type"] == "error":
+                    break
+            await b401.close()
+            return evs
+
+        evs_401 = run(go_401())
+        assert len(evs_401) == 1 and evs_401[0]["type"] == "error"
+        assert "401" in evs_401[0]["message"]
+
+        # 3. Connection timeout
+        b_slow = tb.CascadedTextBackend()
+        monkeypatch.setenv("MVG_TALKER_TIMEOUT", "0.2")
+
+        async def go_slow():
+            await b_slow.open({"talker_url": f"http://127.0.0.1:{port}/slow"})
+            await b_slow.send_text("timeout test")
+            evs = []
+            async for ev in b_slow.events():
+                evs.append(ev)
+                if ev["type"] == "error":
+                    break
+            await b_slow.close()
+            return evs
+
+        evs_slow = run(go_slow())
+        assert len(evs_slow) == 1 and evs_slow[0]["type"] == "error"
+    finally:
+        server.shutdown()
+        server.server_close()
