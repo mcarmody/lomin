@@ -4566,8 +4566,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             sess = session_holder.get("session")
             loop = session_loop[0]
             if norm and sess is not None and loop is not None and not loop.is_closed():
+                def _schedule(s=sess, n=norm):
+                    if not s._closed:
+                        asyncio.ensure_future(s.on_stage_event(n))
                 try:
-                    loop.call_soon_threadsafe(asyncio.ensure_future, sess.on_stage_event(norm))
+                    loop.call_soon_threadsafe(_schedule)
                 except RuntimeError:
                     pass
 

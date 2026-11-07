@@ -129,3 +129,20 @@ def test_no_thread_left_after_turn(gw, fake_tts, monkeypatch):
     time.sleep(0.3)
     extra = [t for t in threading.enumerate() if t.ident not in before and "progress" in t.name.lower()]
     assert extra == []
+
+
+def test_cancelled_turn_suppresses_spoken_progress(gw, fake_tts, monkeypatch, tmp_path):
+    monkeypatch.setenv("MVG_SPOKEN_PROGRESS", "1")
+
+    def brain(prompt, session_id, node_id, speaker, speaker_score, timeout, on_partial):
+        gateway._STAGE_SINK.stages.setdefault("events", []).append(
+            {"stage": "tool_start", "detail": "checking the logs", "t": 0.1}
+        )
+        assert gateway.cancel_active_turn("n1") in ("cancelled", "stopped_speech_only")
+        time.sleep(0.2)
+        return ""
+
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", brain)
+    ev = _turn(gw)
+    assert "checking the logs" not in " ".join(d.get("text", "") for e, d in ev if e == "sentence")
+    assert _records(tmp_path)[-1]["progress_lines"] == 0

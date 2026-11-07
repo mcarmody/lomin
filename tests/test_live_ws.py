@@ -419,3 +419,70 @@ def test_live_stage_events_produce_two_relay_lines(server, monkeypatch):
         ("[task progress] step one", True),
         ("[task progress] step two", True),
     ]
+
+
+def test_stage_event_during_session_close_leaves_no_unawaited_coroutine(server, monkeypatch):
+    import gc
+    import time
+    import warnings
+
+    monkeypatch.setenv("MVG_TALKER_BACKENDS", "stagerelay=test_live_ws:StageRelayBackend")
+    monkeypatch.setenv("MVG_TALKER_BACKEND", "stagerelay")
+
+    brain_started = threading.Event()
+    client_closed_event = threading.Event()
+    captured_sink = []
+
+    def late_brain(prompt, session_id, node_id, speaker, score, timeout, on_partial=None, stages_out=None, **kw):
+        sink = stages_out if stages_out is not None else getattr(gateway._STAGE_SINK, "stages", None)
+        captured_sink.append(sink)
+        brain_started.set()
+        client_closed_event.wait(5.0)
+        sink["events"].append({"stage": "tool_start", "detail": "late stage event", "t": 0.2})
+        return "final answer"
+
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", late_brain)
+
+    with warnings.catch_warnings(record=True) as recorded_warnings:
+        warnings.simplefilter("always")
+
+        c = Client(server)
+        assert c.status == 101
+        assert brain_started.wait(5.0)
+
+        c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+        client_closed_event.set()
+        try:
+            c.recv()
+        except Exception:
+            pass
+        c.s.close()
+
+        time.sleep(0.1)
+
+        sink = captured_sink[0]
+        closure = dict(zip(sink._on_event.__code__.co_freevars, [cell.cell_contents for cell in sink._on_event.__closure__]))
+        session_loop = closure["session_loop"]
+        assert session_loop[0] is not None
+        assert session_loop[0].is_closed()
+
+        sink["events"].append({"stage": "tool_start", "detail": "closed loop event", "t": 0.3})
+
+        class DummyLoop:
+            def is_closed(self):
+                return False
+
+            def call_soon_threadsafe(self, callback, *args):
+                raise RuntimeError("Event loop is closed")
+
+        session_loop[0] = DummyLoop()
+        gateway._STAGE_SINK.stages = sink
+        gateway._STAGE_SINK.stages.append({"stage": "tool_start", "detail": "race stage event", "t": 0.4})
+
+        gc.collect()
+
+        unawaited = [
+            w for w in recorded_warnings
+            if issubclass(w.category, RuntimeWarning) and "was never awaited" in str(w.message)
+        ]
+        assert len(unawaited) == 0
