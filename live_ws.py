@@ -233,6 +233,12 @@ def run_live_session(ws: WSConn, session_factory, *, max_sec=None, idle_sec=None
                     ev = msg.get("event") if isinstance(msg, dict) else None
                     if ev == "status":
                         await session.status_request()
+                    elif ev == "text":
+                        if isinstance(msg.get("text"), str) and msg["text"].strip() and hasattr(session, "feed_text"):
+                            await session.feed_text(msg["text"], silent=bool(msg.get("silent", False)))
+                    elif ev == "audio_end":
+                        if hasattr(session, "flush_audio"):
+                            await session.flush_audio()
                     elif ev == "end":
                         outcome.update(v="client_ended")
                         return
