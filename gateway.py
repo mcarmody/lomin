@@ -227,7 +227,9 @@ from pending_and_auth import (  # noqa: E402,F401
 # Every hook is optional:
 #   apply_defaults() -> None                     fill env defaults (setdefault only)
 #   brain_call(target, prompt, timeout) -> str   the agent answers one framed prompt
-#   brain_call_stream(target, prompt, timeout, on_partial, stages_out) -> str
+#   brain_call_stream(target, prompt, timeout, on_partial, stages_out[, audio_clips=]) -> str
+#                                                 audio_clips: list of 16 kHz WAV bytes, passed only
+#                                                 if the signature accepts it and MVG_SPLICE_RAW_AUDIO=1
 #   classify                                      module with classify_choice(...) (addressee classifier)
 #   try_intent(text) -> dict | None               deterministic fast path
 PLUGIN_NAME = os.environ.get("MVG_PLUGIN", "").strip()
@@ -240,8 +242,11 @@ if PLUGIN_NAME:
               file=sys.stderr)
 if _plugin is not None and hasattr(_plugin, "apply_defaults"):
     _plugin.apply_defaults()
+_PLUGIN_MOD = _plugin
 _plugin_brain_call = getattr(_plugin, "brain_call", None)
 _plugin_brain_call_stream = getattr(_plugin, "brain_call_stream", None)
+_plugin_brain_cancel = getattr(_plugin, "brain_cancel", None)
+_plugin_talker_instructions = getattr(_plugin, "talker_instructions", None)
 # Kept as `_jev_classifier`: test_ambient.py monkeypatches its attributes.
 _jev_classifier = getattr(_plugin, "classify", None)
 _try_intent = getattr(_plugin, "try_intent", None) or (lambda text: None)
@@ -1870,7 +1875,7 @@ def make_frame_ctx(voice_id: dict | None, claimed_speaker: str = "", open_room: 
                    reply_cap_words: int = 60, enrolled: str | None = None,
                    device: str = "", medium: str = "", target: str = "",
                    image_b64: str | None = None, burst_images_b64: list[str] | None = None,
-                   audio_b64: str | None = None) -> dict:
+                   audio_b64: str | None = None, audio_clips: list[bytes] | None = None) -> dict:
     ctx = {"enrolled": enrolled, "voice_id": voice_id or {"status": "unavailable", "id": "", "score": 0.0},
            "claimed_speaker": claimed_speaker or "", "open_room": bool(open_room),
            "reply_cap_words": reply_cap_words, "device": device or "", "medium": medium or "",
@@ -1881,7 +1886,50 @@ def make_frame_ctx(voice_id: dict | None, claimed_speaker: str = "", open_room: 
         ctx["burst_images_b64"] = burst_images_b64
     if audio_b64:
         ctx["audio_b64"] = audio_b64
+    if audio_clips:
+        ctx["audio_clips"] = audio_clips
     return ctx
+
+
+def audio_clips_max_bytes() -> int:
+    try:
+        return max(0, int(os.environ.get("MVG_AUDIO_CLIPS_MAX_BYTES", str(2 * 1024 * 1024))))
+    except ValueError:
+        return 2 * 1024 * 1024
+
+
+def collect_audio_clips(wav_bytes: bytes | None) -> list[bytes] | None:
+    """The raw-audio clips handed to a plugin brain (`audio_clips`). None unless
+    MVG_SPLICE_RAW_AUDIO=1 and there is audio; over MVG_AUDIO_CLIPS_MAX_BYTES the
+    clips are dropped and the drop is logged, and the turn goes on without them."""
+    if os.environ.get("MVG_SPLICE_RAW_AUDIO", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+    if not wav_bytes:
+        return None
+    clips = [bytes(wav_bytes)]
+    if sum(len(c) for c in clips) > audio_clips_max_bytes():
+        log_fallback("audio_clips_over_cap", tts_engine="audio-clips-skip",
+                     bytes=sum(len(c) for c in clips), cap=audio_clips_max_bytes())
+        return None
+    return clips
+
+
+# Orchestrator instruction (Mode 2, specs/2026-11-05-talker-thinker-live-architecture.md 6.7).
+# Generic on purpose: no tool, agent or household names. A site adds its own half
+# with MVG_ORCHESTRATOR_TEXT. Off unless MVG_ORCHESTRATOR_PROMPT=1; MVG_ORCHESTRATOR_TARGETS
+# (comma list) limits it to those brain targets.
+ORCHESTRATOR_TEXT = ("You are the voice orchestrator. Speak one specific sentence first, then delegate. "
+                     "Do not do the work yourself: hand it to a subagent and choose that subagent's "
+                     "model and effort for the task. If a follow-up arrives while a task runs, say so "
+                     "and do not start a second task silently. Progress lines come from the harness: "
+                     "do not invent progress.")
+
+
+def orchestrator_enabled(target: str = "") -> bool:
+    if os.environ.get("MVG_ORCHESTRATOR_PROMPT", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    only = [t.strip() for t in os.environ.get("MVG_ORCHESTRATOR_TARGETS", "").split(",") if t.strip()]
+    return not only or target in only
 
 
 def _display_name(name: str) -> str:
@@ -1911,7 +1959,10 @@ def frame_voice_prompt(prompt: str, node_id: str, ctx: dict) -> str:
     if ctx.get("open_room"):
         bits.append("open room")
     cap = ctx.get("reply_cap_words") or 60
-    return f"[{' · '.join(bits)}] {prompt}\n\n" + SPOKEN_SUFFIX.format(n=cap) + " " + SECURITY_SUFFIX
+    tail = SPOKEN_SUFFIX.format(n=cap) + " " + SECURITY_SUFFIX
+    if orchestrator_enabled(ctx.get("target") or ""):
+        tail += " " + (os.environ.get("MVG_ORCHESTRATOR_TEXT", "").strip() or ORCHESTRATOR_TEXT)
+    return f"[{' · '.join(bits)}] {prompt}\n\n" + tail
 
 
 # Per-thread framing context for the brain worker thread (same pattern as
@@ -2071,8 +2122,20 @@ def http_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: 
 BRAIN_CALL = http_brain_call if MVG_BRAIN == "http" else plugin_brain_call
 
 
+def _accepts_kwarg(fn, name: str) -> bool:
+    """True if fn takes a keyword `name` (or **kwargs). Checked per call so a
+    patched hook is honoured; a signature that cannot be read counts as no."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return False
+    return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def plugin_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: str,
-                             speaker_score, timeout: int, on_partial) -> str:
+                             speaker_score, timeout: int, on_partial,
+                             task_id: str | None = None,
+                             audio_clips: list[bytes] | None = None) -> str:
     """Streaming brain through the plugin. With a plugin brain_call_stream, that
     hook gets on_partial and the per-turn stage sink. Without one, the plugin's
     plain brain_call answers and on_partial fires once with the full reply."""
@@ -2081,9 +2144,14 @@ def plugin_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker
         on_partial(reply)
         return reply
     wrapped = _frame_for_call(prompt, node_id, speaker, speaker_score)
+    extra = {}
+    if task_id is not None and _accepts_kwarg(_plugin_brain_call_stream, "task_id"):
+        extra["task_id"] = task_id
+    if audio_clips is not None and _accepts_kwarg(_plugin_brain_call_stream, "audio_clips"):
+        extra["audio_clips"] = audio_clips
     return _plugin_brain_call_stream(
         _call_target(node_id), wrapped, timeout, on_partial,
-        getattr(_STAGE_SINK, "stages", None),
+        getattr(_STAGE_SINK, "stages", None), **extra,
     )
 
 
@@ -2095,7 +2163,216 @@ STREAM_BRAIN_CALL = http_brain_call_stream if MVG_BRAIN == "http" else plugin_br
 # existing override of that hook keeps its signature.
 _STAGE_SINK = threading.local()
 
+# Active brain call per node: {node_id: {"task_id", "target", "started", "cancel_event", "wake"}}.
+# A turn registers on entry and always removes its entry on exit (success, error, cancel).
+_ACTIVE_TASKS: dict = {}
+_ACTIVE_TASKS_LOCK = threading.Lock()
+
+
+def _register_task(node_id: str, target: str, task_id: str | None = None) -> dict:
+    task = {"task_id": task_id or uuid.uuid4().hex[:12], "target": target, "started": time.time(),
+            "cancel_event": threading.Event(), "wake": None}
+    with _ACTIVE_TASKS_LOCK:
+        _ACTIVE_TASKS[node_id or ""] = task
+    return task
+
+
+def _unregister_task(node_id: str, task: dict) -> None:
+    with _ACTIVE_TASKS_LOCK:
+        if _ACTIVE_TASKS.get(node_id or "") is task:
+            del _ACTIVE_TASKS[node_id or ""]
+
+
+def _resolve_talker_instructions(target: str, node_id: str) -> str | None:
+    """Resolve system instructions for a live Talker session.
+
+    Checks the plugin's `talker_instructions(target, node_id)` hook first, then
+    falls back to `<MVG_PERSONA_DIR>/<target>/voice_talker.md` followed by
+    `<MVG_PERSONA_DIR>/<target>/voice.md`."""
+    hook = _plugin_talker_instructions
+    if hook is None:
+        for mod in (_PLUGIN_MOD, _plugin):
+            if mod is not None:
+                hook = getattr(mod, "talker_instructions", None)
+                if callable(hook):
+                    break
+    if callable(hook):
+        try:
+            res = hook(target, node_id)
+            if isinstance(res, str) and res.strip():
+                return res.strip()
+        except Exception:
+            pass
+    persona_dir = os.environ.get("MVG_PERSONA_DIR", "").strip()
+    target_clean = (target or "").strip()
+    if persona_dir and target_clean and "/" not in target_clean and "\\" not in target_clean and ".." not in target_clean and target_clean != ".":
+        base = Path(persona_dir) / target_clean
+        for filename in ("voice_talker.md", "voice.md"):
+            p = base / filename
+            try:
+                if p.is_file():
+                    text = p.read_text(encoding="utf-8").strip()
+                    if text:
+                        return text
+            except OSError:
+                continue
+    return None
+
+
+def cancel_active_turn(node_id: str) -> str:
+    """Cancel the node's running brain turn. Returns "cancelled" (the plugin's
+    brain_cancel hook ran and returned truthy), "stopped_speech_only" (no hook,
+    or it returned falsy or raised: the turn stops speaking and drops the
+    result, the brain may still be running) or "no_active_turn" (nothing
+    running, or already cancelled)."""
+    with _ACTIVE_TASKS_LOCK:
+        task = _ACTIVE_TASKS.get(node_id or "")
+        if task is None or task["cancel_event"].is_set():
+            return "no_active_turn"
+        task["cancel_event"].set()
+        target, task_id, wake = task["target"], task["task_id"], task["wake"]
+    if wake is not None:
+        wake.set()
+    hook = _plugin_brain_cancel
+    if hook is None:
+        return "stopped_speech_only"
+    try:
+        return "cancelled" if hook(target, task_id) else "stopped_speech_only"
+    except Exception as exc:
+        log_fallback(f"brain_cancel_failed:{str(exc)[:200]}", tts_engine="cancel-skip")
+        return "stopped_speech_only"
+
+STAGE_DETAIL_MAX = 120
+
+
+def normalize_stage_event(raw) -> dict | None:
+    """Normalise a brain stage event to `{"stage": str, "detail": str, "t": float}`.
+
+    For consumers of stage events (progress narration); it does not touch what
+    is written to the turn record's `stages`. Accepts a dict with `stage` (or
+    `name` / `event`), optional `detail` (or `message` / `text`), optional `t`
+    in seconds (or `t_s`, or `t_ms` / `ms` in milliseconds). Missing detail
+    becomes "", missing or bad `t` becomes 0.0, `detail` is cut to
+    STAGE_DETAIL_MAX characters. Anything that is not a dict, or has no usable
+    stage name, gives None."""
+    if not isinstance(raw, dict):
+        return None
+    stage = ""
+    for key in ("stage", "name", "event"):
+        v = raw.get(key)
+        if isinstance(v, str) and v.strip():
+            stage = v.strip()
+            break
+    if not stage:
+        return None
+    detail = ""
+    for key in ("detail", "message", "text"):
+        v = raw.get(key)
+        if isinstance(v, str) and v.strip():
+            detail = " ".join(v.split())[:STAGE_DETAIL_MAX]
+            break
+    t = 0.0
+    for key, scale in (("t", 1.0), ("t_s", 1.0), ("t_ms", 0.001), ("ms", 0.001)):
+        v = raw.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            t = float(v) * scale
+            break
+    return {"stage": stage, "detail": detail, "t": t}
+
+
+# --- Spoken progress (MVG_SPOKEN_PROGRESS=1) ----------------------------------
+
+def context_opener_enabled() -> bool:
+    return os.environ.get("MVG_CONTEXT_OPENER", "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+def spoken_progress_enabled() -> bool:
+    return os.environ.get("MVG_SPOKEN_PROGRESS", "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _env_num(name: str, default, cast):
+    try:
+        return cast(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return cast(default)
+
+
+class ProgressNarrator:
+    """Decides when a stage event becomes one spoken progress line. Pure: the
+    caller supplies the clock and the playback / reply state. A line is allowed
+    only when nothing is playing, the real reply has not started, the event's
+    stage is allowlisted, at least min_gap seconds have passed since the last
+    line, and fewer than max_lines have been spoken. The newest unseen eligible
+    event wins; older unseen ones are dropped, never queued."""
+
+    def __init__(self, events_source, clock=time.time, min_gap=None, max_lines=None, allow=None):
+        self.source = events_source  # callable -> list of raw events
+        self.clock = clock
+        self.min_gap = min_gap if min_gap is not None else _env_num("MVG_PROGRESS_MIN_GAP_SEC", "12", float)
+        self.max_lines = max_lines if max_lines is not None else _env_num("MVG_PROGRESS_MAX_PER_TURN", "3", int)
+        raw = os.environ.get("MVG_PROGRESS_STAGES", "tool_start,milestone")
+        self.allow = frozenset(allow if allow is not None else (x.strip() for x in raw.split(",") if x.strip()))
+        self.seen = 0
+        self.lines = 0
+        self.last_spoken = None
+
+    def next_line(self, playing: bool, reply_started: bool):
+        try:
+            events = list(self.source() or [])
+        except Exception:
+            return None
+        fresh, self.seen = events[self.seen:], len(events)
+        if reply_started or playing or self.lines >= self.max_lines:
+            return None
+        now = self.clock()
+        if self.last_spoken is not None and now - self.last_spoken < self.min_gap:
+            return None
+        for raw in reversed(fresh):
+            ev = normalize_stage_event(raw)
+            if ev and ev["stage"] in self.allow and ev["detail"]:
+                self.lines += 1
+                self.last_spoken = now
+                return ev["detail"]
+        return None
+
 APOLOGY = f"{_display_name(AGENT_NAME)} is busy right now, try again in a moment."
+
+
+# --- Spoken cancel (MVG_SPOKEN_CANCEL=1) -------------------------------------
+
+_DEFAULT_CANCEL_PHRASES = ("stop", "cancel", "cancel that", "never mind", "nevermind", "stop that")
+_CANCEL_ACKS = {
+    "cancelled": "Cancelled.",
+    "stopped_speech_only": "Stopped talking, but the task may still be running.",
+}
+
+
+def _cancel_phrases() -> frozenset:
+    raw = os.environ.get("MVG_CANCEL_PHRASES", "")
+    items = [_norm_cancel_text(p) for p in raw.split(",")] if raw.strip() else list(_DEFAULT_CANCEL_PHRASES)
+    return frozenset(p for p in items if p)
+
+
+def _norm_cancel_text(text: str) -> str:
+    cleaned = "".join(c if (c.isalnum() or c.isspace() or c == "'") else " " for c in (text or "").lower())
+    return " ".join(cleaned.replace("'", "").split())
+
+
+def is_cancel_phrase(text: str) -> bool:
+    """True when the transcript is a spoken cancel: an exact match on the phrase
+    set, or at most 3 words starting with "stop" or "cancel". Never a substring
+    match, so "stop the deploy script from restarting" is not a cancel."""
+    norm = _norm_cancel_text(text)
+    if not norm:
+        return False
+    if norm in _cancel_phrases():
+        return True
+    words = norm.split()
+    return len(words) <= 3 and words[0] in ("stop", "cancel")
+
+
+def spoken_cancel_enabled() -> bool:
+    return os.environ.get("MVG_SPOKEN_CANCEL", "0").strip().lower() in ("1", "true", "on", "yes")
 
 
 # --- TTS ---------------------------------------------------------------------
@@ -2588,6 +2865,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._handle_health()
         if path == "/voice/pending" and is_defer_enabled():
             return self._handle_pending_get()
+        if path == "/voice/live":
+            return self._handle_voice_live()
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -3211,8 +3490,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return claimed[:64], False
         return "", True
 
-    def _stream_brain_turn(self, *, t0, turn_id, prompt, session_id, node_id, speaker,
-                           speaker_score, ctx, endpoint, opts, log_extra=None):
+    def _stream_brain_turn(self, *, node_id, ctx, **kw):
+        """Registers the turn as the node's active task (for cancel_active_turn)
+        and always removes it on the way out."""
+        task = _register_task(node_id, ctx.get("target") or resolve_target(node_id))
+        ctx["task_id"] = task["task_id"]
+        try:
+            return GatewayHandler._stream_brain_turn_inner(self, node_id=node_id, ctx=ctx, task=task, **kw)
+        finally:
+            _unregister_task(node_id, task)
+
+    def _stream_brain_turn_inner(self, *, t0, turn_id, prompt, session_id, node_id, speaker,
+                                 speaker_score, ctx, endpoint, opts, task, log_extra=None):
         """The shared brain -> sentence-TTS stream behind /ask/stream and
         /voice/turn: brain call, sentence cutting, TTS/gap-fill, `status`
         keepalives, then `reply` + `done`. The caller has already sent the
@@ -3227,6 +3516,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         segmenter = SentenceSegmenter(early_first=FIRST_CLAUSE_EARLY)
         wake = threading.Event()  # set when a sentence is queued or the brain finishes
+        task["wake"] = wake
+        cancel_event = task["cancel_event"]  # set by cancel_active_turn: stop speaking, drop the result
         spoken_text = ""  # stripped reply text already fed to the segmenter
         raw_seen = ""
         md_pending = ""
@@ -3282,6 +3573,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             hub-dialect `audio_chunk` the room ear plays from. False = client gone.
             A gap-fill clip (`filler`) is not the answer, so it does not move the
             turn to `speaking`."""
+            if cancel_event.is_set():
+                return True  # cancelled: nothing more reaches the client
             if not event.get("filler") and not _mark_speaking():
                 return False
             if not self._sse("sentence", event):
@@ -3310,7 +3603,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             timing["play_end"] = start + nbytes / (AUDIO_TARGET_RATE * 2.0)
 
         def _submit(sentence_text: str) -> None:
-            if not sentence_text.strip():
+            if not sentence_text.strip() or cancel_event.is_set():
                 return
             timing["sentences"] += 1
             if timing["first_sentence_ms"] is None:
@@ -3334,10 +3627,40 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return {"tts_stream": False, "text_sentences": text_mode, "turn_id": turn_id}
             return {"tts_stream": True, "first_audio_ms": timing["first_audio_ms"],
                     "tts_first_ms": timing["tts_first_ms"], "audio_chunks": timing["chunks"],
-                    "turn_id": turn_id, "gap_fill": list(gap["used"])}
+                    "turn_id": turn_id, "gap_fill": list(gap["used"]),
+                    "progress_lines": progress.lines if progress else 0}
 
         reply = ""
         stages: dict = {}
+        # Spoken progress (MVG_SPOKEN_PROGRESS): pcm stream mode only, never on a
+        # fixed-reply (intent) turn. Events come from stages["events"].
+        progress = (ProgressNarrator(lambda: stages.get("events"))
+                    if spoken_progress_enabled() and stream_mode and not opts.get("intent_result")
+                    else None)
+        # Context opener (MVG_CONTEXT_OPENER): one specific line from the first
+        # stage event in place of the generic opener clip. pcm stream mode only.
+        opener = {"on": context_opener_enabled() and stream_mode and not opts.get("intent_result"),
+                  "kind": None, "ms": None}
+
+        def _maybe_context_opener() -> None:
+            if not opener["on"] or opener["kind"] is not None or cancel_event.is_set():
+                return
+            if raw_seen or timing["first_audio_ms"] is not None or timing["sentences"]:
+                opener["on"] = False  # the real reply (or other speech) got there first
+                return
+            events = stages.get("events")
+            if not events:
+                return
+            ev = normalize_stage_event(events[0])
+            opener["on"] = False  # decided by the first event, once
+            if not ev or not ev["detail"] or len(ev["detail"]) > STAGE_DETAIL_MAX:
+                return
+            gap["open"] = True  # the generic opener clip must not also play
+            opener["kind"], opener["ms"] = "stage", _ms_since_start()
+            if progress is not None:
+                progress.seen, progress.last_spoken = 1, progress.clock()
+            _submit("One moment, " + ev["detail"])
+
         # LAMMAS per-turn record: intent name or "miss", match_ms, handler_ms.
         intent_rec: dict = {"intent": "miss", "intent_match_ms": None, "intent_handler_ms": None}
 
@@ -3354,11 +3677,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "brain_first_text_ms": timing["brain_first_text_ms"],
                 "first_sentence_ms": timing["first_sentence_ms"],
                 "gap_fill_first_ms": gap["first_ms"],
+                "orchestrator": orchestrator_enabled(target),
                 "tts_first_ms": timing["tts_first_ms"],
                 "first_audio_ms": timing["first_audio_ms"],
                 "last_audio_ms": timing["last_audio_ms"],
                 "total_ms": total_ms, "sentences": timing["sentences"],
                 "reply_chars": len(reply), "gap_fill": list(gap["used"]),
+                "progress_lines": progress.lines if progress else 0,
+                **({"opener_kind": opener["kind"] or ("gap_fill" if gap["used"] else "none"),
+                    "opener_ms": opener["ms"] if opener["kind"] else gap["first_ms"]}
+                   if context_opener_enabled() else {}),
                 "audio_s": round(timing["audio_bytes"] / (AUDIO_TARGET_RATE * 2.0), 3),
                 "tts_engine": timing["engine"] if stream_mode else ("text" if text_mode else "wav"),
                 "text_sentences": text_mode,
@@ -3366,12 +3694,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "target": target, "outcome": outcome, "endpoint": endpoint,
                 **intent_rec,
             }
-            if stages:
+            rec_stages = {k: v for k, v in stages.items() if k != "events"}
+            if rec_stages:
                 # Raw epoch ms per stage, each on the clock of the host that
                 # stamped it (README: "Hand-off stages"). `_ms` keys ending
                 # `_pi_ms`, inserted/first_partial_seen/final_seen are this
                 # host (this box); claim_recv .. partial_write_start are the desktop.
-                rec["stages"] = dict(stages)
+                rec["stages"] = rec_stages
             rec.update(_correlated_stt(node_id, t0))
             _gap_turn_done(gap["used"])
             log_latency(rec)
@@ -3590,12 +3919,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if fast["intent"]:  # matched but the handler failed: still a brain turn
                     intent_rec["intent_fallthrough"] = f"{fast['intent']}:{fast['reason']}"
                 call_kwargs = {}
+                if ctx.get("task_id"):
+                    call_kwargs["task_id"] = ctx["task_id"]
                 enable_vision = is_vision_enabled()
                 if enable_vision:
                     if ctx.get("image_b64"):
                         call_kwargs["image_b64"] = ctx["image_b64"]
                     if ctx.get("burst_images_b64"):
                         call_kwargs["burst_images_b64"] = ctx["burst_images_b64"]
+                if ctx.get("audio_clips"):
+                    call_kwargs["audio_clips"] = ctx["audio_clips"]
                 brain_direct_audio = bool(BRAIN_DIRECT_AUDIO) or (os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1")
                 if brain_direct_audio:
                     if ctx.get("audio_b64"):
@@ -3642,6 +3975,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             while True:
                 with lock:
                     available = len(futures)
+                if cancel_event.is_set():
+                    return available  # cancelled: skip whatever is still queued
                 if next_idx >= available:
                     return next_idx
                 fut = futures[next_idx]
@@ -3681,7 +4016,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         idx = 0
         client_gone = False
         last_status = time.time()
-        while not done_event.is_set():
+        while not done_event.is_set() and not cancel_event.is_set():
             wake.clear()
             idx = _drain_ready(idx)
             if idx is None:
@@ -3690,9 +4025,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not done_event.is_set():
                 with lock:
                     nothing_queued = idx >= len(futures)
+                if nothing_queued:
+                    _maybe_context_opener()
                 if nothing_queued and not _maybe_gap_fill():
                     client_gone = True
                     break
+                if nothing_queued and progress is not None and not cancel_event.is_set():
+                    play_end = timing["play_end"]
+                    line = progress.next_line(
+                        playing=play_end is not None and play_end > time.time(),
+                        reply_started=bool(raw_seen))
+                    if line:
+                        _submit(line)
             # Wake the moment a sentence is queued (was: a fixed 150 ms sleep
             # that delayed every first sentence by up to one poll interval).
             wake.wait(self.STREAM_STATUS_POLL_SEC)
@@ -3710,7 +4054,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             _finish("error:client_gone")
             return ("error:client_gone", "")
 
-        if "error" in result_box:
+        if cancel_event.is_set():
+            outcome = "cancelled"
+            reply = ""
+        elif "error" in result_box:
             outcome = "error:brain_exception"
             reply = APOLOGY
             _submit(reply)
@@ -4111,15 +4458,175 @@ class GatewayHandler(BaseHTTPRequestHandler):
                              reply_cap_words=int(prof["reply_cap_words"]),
                              device=device, medium=medium, target=target,
                              image_b64=image_b64, burst_images_b64=burst_images_b64,
-                             audio_b64=audio_b64)
+                             audio_b64=audio_b64, audio_clips=collect_audio_clips(wav_bytes))
         target_extra = {"target_rejected": True} if (
             requested_target and requested_target != target) else {}
+        turn_opts = {"voice": True, "tts": tts, "gap_fill": bool(prof["gap_fill"]),
+                     "audio_chunk": audio_chunk}
+        if spoken_cancel_enabled() and is_cancel_phrase(transcript):
+            # Cancel the node's running turn first; the acknowledgement then runs as
+            # a fixed-reply turn. No running turn: fall through as an ordinary turn.
+            cancel_result = cancel_active_turn(node_id)
+            ack = _CANCEL_ACKS.get(cancel_result)
+            if ack:
+                turn_opts["intent_result"] = {"hit": True, "intent": "cancel", "match_ms": 0.0,
+                                              "handler_ms": 0.0, "reply": ack, "reason": "spoken_cancel"}
+                turn_opts["gap_fill"] = False
         self._stream_brain_turn(
             t0=t0, turn_id=turn_id, prompt=transcript, session_id=session_id, node_id=node_id,
             speaker=speaker_id, speaker_score=vid.get("score"), ctx=ctx, endpoint="/voice/turn",
-            opts={"voice": True, "tts": tts, "gap_fill": bool(prof["gap_fill"]),
-                  "audio_chunk": audio_chunk},
+            opts=turn_opts,
             log_extra={**log_extra, **id_extra, "target": target, **target_extra})
+
+    # -- /voice/live (WebSocket, live_ws.py) --
+
+    def _handle_voice_live(self):
+        import asyncio
+        import live_ws
+        t0 = time.time()
+        qs = parse_qs(urlsplit(self.path).query)
+        node_id = ((qs.get("node_id") or [""])[0] or self.headers.get("X-Node-Id") or "").strip()
+        if not self._check_bearer_auth(node_id, "/voice/live", t0):
+            return
+        profile = resolve_profile(node_id)
+        voice_mode = str(profile.get("voice_mode") or "native").strip()
+        if voice_mode not in ("native", "custom_tts"):
+            self._send_json(400, {"error": f"invalid voice_mode: {voice_mode} (expected native or custom_tts)"})
+            log_request("/voice/live", (time.time() - t0) * 1000, "error:bad_voice_mode", node=node_id)
+            return
+        backend_name = (profile.get("talker_backend")
+                        or os.environ.get("MVG_TALKER_BACKEND", "")).strip()
+        if not backend_name:
+            self._send_json(501, {"error": "live voice is not configured: set MVG_TALKER_BACKEND "
+                                           "(or talker_backend on the node)"})
+            log_request("/voice/live", (time.time() - t0) * 1000, "error:not_configured", node=node_id)
+            return
+        if not live_ws.is_upgrade_request(self.headers):
+            self._send_json(426, {"error": "WebSocket upgrade required"})
+            return
+        if not node_id:
+            self._send_json(400, {"error": "node_id required"})
+            return
+        try:
+            import talker_backend
+            import live_harness
+            backend_cls = talker_backend.load_backend(backend_name)
+        except ValueError as exc:
+            self._send_json(501, {"error": str(exc)})
+            log_request("/voice/live", (time.time() - t0) * 1000, "error:bad_backend", node=node_id)
+            return
+        self.wfile.write(live_ws.handshake_response(self.headers["Sec-WebSocket-Key"]))
+        self.wfile.flush()
+        self.close_connection = True
+        ws = live_ws.WSConn(self.connection, live_ws._env_num("MVG_LIVE_MAX_FRAME", "262144", int))
+        target = resolve_request_target(node_id, None)
+        session_id = f"live-{uuid.uuid4().hex[:8]}"
+        instr = _resolve_talker_instructions(target, node_id)
+        session_holder: dict = {}
+        session_loop: list = [None]
+        default_brain_call = http_brain_call if MVG_BRAIN == "http" else plugin_brain_call
+
+        class _LiveEventList(list):
+            def __init__(self, on_event):
+                super().__init__()
+                self._on_event = on_event
+
+            def append(self, item):
+                super().append(item)
+                self._on_event(item)
+
+            def extend(self, items):
+                for item in items:
+                    self.append(item)
+
+        class _LiveStageSink(dict):
+            def __init__(self, on_event):
+                super().__init__()
+                self._on_event = on_event
+                super().__setitem__("events", _LiveEventList(on_event))
+
+            def __setitem__(self, key, val):
+                if key == "events" and isinstance(val, list) and not isinstance(val, _LiveEventList):
+                    el = _LiveEventList(self._on_event)
+                    for item in val:
+                        el.append(item)
+                    val = el
+                super().__setitem__(key, val)
+
+            def setdefault(self, key, default=None):
+                if key not in self:
+                    self[key] = default
+                return self[key]
+
+            def append(self, item):
+                self["events"].append(item)
+
+        def _forward_stage_event(ev):
+            norm = normalize_stage_event(ev)
+            sess = session_holder.get("session")
+            loop = session_loop[0]
+            if norm and sess is not None and loop is not None and not loop.is_closed():
+                def _schedule(s=sess, n=norm):
+                    if not s._closed:
+                        asyncio.ensure_future(s.on_stage_event(n))
+                try:
+                    loop.call_soon_threadsafe(_schedule)
+                except RuntimeError:
+                    pass
+
+        def brain(request, task_id):
+            task = _register_task(node_id, target, task_id=task_id)
+            tid = task["task_id"]
+            stages_out = _LiveStageSink(_forward_stage_event)
+            _STAGE_SINK.stages = stages_out
+            try:
+                use_stream = (
+                    BRAIN_CALL is default_brain_call
+                    and (
+                        STREAM_BRAIN_CALL is not plugin_brain_call_stream
+                        or _plugin_brain_call_stream is not None
+                    )
+                )
+                if use_stream:
+                    call_kwargs = {"task_id": tid, "stages_out": stages_out}
+                    try:
+                        params = inspect.signature(STREAM_BRAIN_CALL).parameters
+                        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                        filtered = {k: v for k, v in call_kwargs.items() if has_var_kw or k in params}
+                    except (ValueError, TypeError):
+                        filtered = {}
+                    return STREAM_BRAIN_CALL(
+                        request, session_id, node_id, "", None, HIVE_TIMEOUT,
+                        lambda _partial: None, **filtered,
+                    )
+                call_kwargs = {"task_id": tid, "stages_out": stages_out}
+                try:
+                    params = inspect.signature(BRAIN_CALL).parameters
+                    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                    filtered = {k: v for k, v in call_kwargs.items() if has_var_kw or k in params}
+                except (ValueError, TypeError):
+                    filtered = {}
+                return BRAIN_CALL(request, session_id, node_id, "", None, HIVE_TIMEOUT, **filtered)
+            finally:
+                _STAGE_SINK.stages = None
+                _unregister_task(node_id, task)
+
+        def factory(send_to_client):
+            try:
+                session_loop[0] = asyncio.get_running_loop()
+            except RuntimeError:
+                session_loop[0] = None
+            cfg = {"node_id": node_id, "target": target, "voice_mode": voice_mode}
+            if instr:
+                cfg["instructions"] = instr
+            sess = live_harness.LiveSession(
+                backend_cls(), cfg, send_to_client, brain,
+                getattr(sys.modules[__name__], "cancel_active_turn", None),
+                lambda text: synthesize(text)[0])
+            session_holder["session"] = sess
+            return sess
+        outcome = live_ws.run_live_session(ws, factory)
+        log_request("/voice/live", (time.time() - t0) * 1000, outcome, node=node_id, backend=backend_name)
 
     # -- /v1/audio/speech --
 
