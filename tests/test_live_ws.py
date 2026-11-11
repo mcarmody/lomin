@@ -60,6 +60,17 @@ def _env(monkeypatch):
     sys.modules.setdefault("test_live_ws", sys.modules[__name__])
 
 
+@pytest.fixture(autouse=True)
+def _clear_auth_failures():
+    """Failed-auth counts are per client IP and every test here is 127.0.0.1."""
+    verifier = gateway.get_device_token_verifier()
+    with verifier._lock:
+        verifier._failures.clear()
+    yield
+    with verifier._lock:
+        verifier._failures.clear()
+
+
 class Client:
     def __init__(self, port, path="/voice/live?node_id=n1", headers=None, upgrade=True):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -486,3 +497,96 @@ def test_stage_event_during_session_close_leaves_no_unawaited_coroutine(server, 
             if issubclass(w.category, RuntimeWarning) and "was never awaited" in str(w.message)
         ]
         assert len(unawaited) == 0
+
+
+def _watch_tokens(monkeypatch, tmp_path, value):
+    f = tmp_path / "watch-tokens.json"
+    f.write_text(json.dumps({"tok": value}))
+    monkeypatch.setattr(gateway, "WATCH_TOKENS_PATH", f)
+
+
+def test_live_watch_route_bad_token_is_401(server, monkeypatch, tmp_path):
+    _watch_tokens(monkeypatch, tmp_path, {"nodes": ["watch"], "speaker": "alice"})
+    monkeypatch.setenv("MVG_DEVICE_TOKENS", "n1:secret")
+    for headers in ({"X-Watch-Route": "1"},
+                    {"X-Watch-Route": "1", "Authorization": "Bearer wrong"},
+                    # the device token is not a watch token
+                    {"X-Watch-Route": "1", "Authorization": "Bearer secret"}):
+        c = Client(server, headers=headers)
+        assert c.status == 401
+        assert '"unauthorized"' in c.s.recv(4096).decode()
+        c.s.close()
+
+
+def test_live_watch_route_failures_count_toward_lockout(server, monkeypatch, tmp_path):
+    _watch_tokens(monkeypatch, tmp_path, "watch")
+    monkeypatch.setenv("MVG_DEVICE_TOKENS", "n1:secret")
+    monkeypatch.setenv("MVG_AUTH_MAX_FAILURES", "2")
+    statuses = []
+    for _ in range(3):
+        c = Client(server, headers={"X-Watch-Route": "1", "Authorization": "Bearer wrong"})
+        statuses.append(c.status)
+        c.s.close()
+    assert statuses == [401, 401, 429]
+
+
+def test_live_without_watch_route_ignores_watch_tokens(server, monkeypatch, tmp_path):
+    _watch_tokens(monkeypatch, tmp_path, "watch")
+    monkeypatch.setenv("MVG_DEVICE_TOKENS", "n1:secret")
+    assert Client(server, headers={"Authorization": "Bearer tok"}).status == 401
+    assert Client(server, headers={"Authorization": "Bearer secret"}).status == 101
+
+
+def test_live_watch_route_good_token_sets_node_and_speaker(server, monkeypatch, tmp_path):
+    monkeypatch.setenv("MVG_TALKER_BACKENDS", "inspect=test_live_ws:InspectBackend")
+    monkeypatch.setenv("MVG_TALKER_BACKEND", "inspect")
+    monkeypatch.setenv("MVG_TRUSTED_SPEAKERS", "alice")
+    _watch_tokens(monkeypatch, tmp_path, {"nodes": ["watch-node"], "speaker": "alice"})
+
+    c = Client(server, path="/voice/live?node_id=other",
+               headers={"X-Watch-Route": "1", "Authorization": "Bearer tok"})
+    assert c.status == 101
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c.recv()
+    assert InspectBackend.last_instance.opened_with["node_id"] == "watch-node"
+
+
+class ThinkOnceBackend(EchoBackend):
+    async def open(self, config):
+        await super().open(config)
+        await self.q.put({"type": "tool_call", "call_id": "t1", "name": "call_thinker",
+                          "args": {"request": "do it"}})
+
+    async def send_tool_result(self, call_id, result):
+        await super().send_tool_result(call_id, result)
+
+    async def send_text(self, text, *, silent=False):
+        await super().send_text(text, silent=silent)
+        if text.startswith("[thinker result"):
+            await self.q.put({"type": "text", "text": "thought", "spoken": True})
+
+
+def test_live_thinker_frame_carries_device_speaker_and_trust(server, monkeypatch, tmp_path):
+    monkeypatch.setenv("MVG_TALKER_BACKENDS", "thinkonce=test_live_ws:ThinkOnceBackend")
+    monkeypatch.setenv("MVG_TALKER_BACKEND", "thinkonce")
+    monkeypatch.setenv("MVG_TRUSTED_SPEAKERS", "alice")
+    _watch_tokens(monkeypatch, tmp_path, {"nodes": ["watch-node"], "speaker": "alice"})
+    seen = []
+
+    def real_brain(prompt, session_id, node_id, speaker, score, timeout, on_partial=None, **kw):
+        seen.append((node_id, gateway._frame_for_call(prompt, node_id, speaker, score)))
+        return "done"
+
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", real_brain)
+
+    c = Client(server, path="/voice/live?node_id=other",
+               headers={"X-Watch-Route": "1", "Authorization": "Bearer tok"})
+    assert c.status == 101
+    op, payload = c.recv()
+    assert json.loads(payload)["text"] == "thought"
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c.recv()
+    assert seen and seen[0][0] == "watch-node"
+    assert "speaker: Alice (paired device)" in seen[0][1]
+    assert "trusted: paired device" in seen[0][1]
+    assert gateway.SECURITY_SUFFIX not in seen[0][1]

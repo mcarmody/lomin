@@ -214,6 +214,7 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_CLASSIFY_KEY` | `lomin.ambient` — the `classify_choice` task key for the addressee question |
 | `MVG_LOG_NAME` | `lomin.jsonl` — request log file name under `MVG_LOG_DIR` |
 | `MVG_OWNER_NAME` | `the owner` — who must confirm a spoken security request in text |
+| `MVG_TRUSTED_SPEAKERS` | empty — comma list of speaker ids (lowercased). A turn verified as one of them (watch-token speaker = `paired device`, or a verified voice ID = `voice ID`) gets `trusted: <basis>` in the frame and the trusted security suffix. A claimed speaker (shared-key header) never counts. Empty: no turn is trusted |
 | `MVG_UNKNOWN_SPEAKER` | `unknown (answer for everyone present)` — the frame's speaker text when voice ID cannot place the speaker |
 | `MVG_AGENT_NAMES` | unset — comma list of every spelling the agent's name can come out of Whisper as; empty means the name pre-gate never matches |
 | `MVG_WAKE_NAMES` | same as `MVG_AGENT_NAMES` — names that count after a greeting ("hey <name>") to open an utterance |
@@ -856,6 +857,25 @@ allowed node ids (`{"<token>": ["watch", "phone"]}`): the
 request's `node_id` is used if it is in the list, else the list's first entry.
 An empty list or any other value type is a 401.
 
+A token's value may also be an object, `{"<token>": {"nodes": ["watch",
+"phone"], "speaker": "alice"}}`. `nodes` follows the list rule. `speaker` is
+lowercased, stripped and kept only if it matches `^[a-z0-9][a-z0-9_-]{0,31}$`
+(else it is dropped); string and list values carry no speaker. The speaker is
+the paired device's person: the frame reads `speaker: Alice (paired device)`
+(a claimed speaker still wins; a verified voice ID is the fallback). It is set
+only by the watch route, never by a header, body field or query string.
+
+Trusted turns: `MVG_TRUSTED_SPEAKERS=alice,bob` makes a turn trusted when the
+watch-token speaker is listed (`trusted: paired device`) or the voice ID is
+`verified` as a listed id (`trusted: voice ID`). A trusted frame carries the bit
+`trusted: <basis>` after the voice ID bit and ends with a different security
+suffix: the turn is verified as that person, a request in it is treated as the
+same request in text, and it still never changes a security setting (speaker or
+voice ID thresholds, ambient or wake thresholds, device pairing, access,
+permissions, credentials): for those the agent says `MVG_OWNER_NAME` must
+confirm in text. Every other turn keeps the unchanged suffix that forbids code
+and config edits. Default (empty list): no turn is trusted.
+
 Headers: `X-Voice-Claimed-Speaker` + `X-Voice-Gateway-Key` (must equal env
 `MVG_TRUSTED_KEY`; otherwise the claim is ignored, as it is whenever the env
 var is unset). Never a body field.
@@ -1076,6 +1096,7 @@ When `MVG_ENABLE_DEFER=1`, the gateway supports deferred asynchronous voice repl
 A bidirectional session driven by a Talker backend (`talker_backend.py`) and the coordination harness (`live_harness.py`). The WebSocket layer is a small stdlib RFC 6455 server (`live_ws.py`), so there is no optional dependency to install.
 
 - Request: `GET /voice/live?node_id=<node>` with the usual WebSocket upgrade headers and, when `MVG_DEVICE_TOKENS` is set, the same bearer token as `/voice/turn` (bad or missing: 401). No backend configured: 501. No upgrade headers: 426.
+- Behind a proxy that sets `X-Watch-Route` (the same header `/voice/turn` uses), the bearer token is checked against the watch-token file instead of `MVG_DEVICE_TOKENS`: no match is a 401 (`error:unauthorized`, counted toward the same lockout), a match overrides `?node_id` with the token's node, and an object token's `speaker` goes into the frame of every Thinker (brain) call, so it carries the same `speaker` and `trusted` bits as `/voice/turn`. Without `X-Watch-Route` nothing changes.
 - **`voice_mode` (`native` | `custom_tts`):** Set `"voice_mode"` in the node's `nodes.json` entry (default `"native"`; any other value returns HTTP `400`).
   - `"native"`: the Talker backend emits 24 kHz mono PCM16 directly (e.g. `GeminiLiveBackend` sets `responseModalities: ["AUDIO"]` with optional `MVG_GEMINI_VOICE`).
   - `"custom_tts"`: the Talker backend emits text (`GeminiLiveBackend` sets `responseModalities: ["TEXT"]` and omits `speechConfig`; `CascadedTextBackend` emits stripped text), and `LiveSession` synthesizes each reply through the gateway's `MVG_TTS_CHAIN` (`synthesize(text)`) into 24 kHz mono PCM16 binary frames. See [`specs/2026-11-07-custom-tts-talker.md`](specs/2026-11-07-custom-tts-talker.md).

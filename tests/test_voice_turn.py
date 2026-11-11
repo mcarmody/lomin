@@ -417,6 +417,67 @@ def test_watch_route_good_token_forces_node(server, stubs, brain, tmp_path):
     assert "node lammen" not in brain[0]["prompt"]
 
 
+def _tokens(tmp_path, value):
+    (tmp_path / "watch-tokens.json").write_text(json.dumps({"tok": value}))
+
+
+@pytest.mark.parametrize("value,req,expect", [
+    ("apple-watch", "x", ("apple-watch", "")),
+    (["watch", "phone"], "phone", ("phone", "")),
+    (["watch", "phone"], "nope", ("watch", "")),
+    ({"nodes": ["watch", "phone"], "speaker": " Alice "}, "phone", ("phone", "alice")),
+    ({"nodes": "watch", "speaker": "alice"}, "", ("watch", "alice")),
+    ({"nodes": ["watch"], "speaker": "../x"}, "", ("watch", "")),
+    ({"nodes": ["watch"], "speaker": 7}, "", ("watch", "")),
+    ({"nodes": [], "speaker": "alice"}, "", (None, "")),
+    ({"speaker": "alice"}, "", (None, "")),
+    (5, "", (None, "")),
+])
+def test_watch_token_entry(tmp_path, value, req, expect):
+    _tokens(tmp_path, value)
+    assert gateway.watch_token_entry("Bearer tok", req) == expect
+    assert gateway.watch_node_for("Bearer tok", req) == expect[0]
+
+
+def test_watch_token_entry_bad_inputs(tmp_path):
+    _tokens(tmp_path, {"nodes": ["watch"], "speaker": "alice"})
+    assert gateway.watch_token_entry("Bearer wrong") == (None, "")
+    assert gateway.watch_token_entry("") == (None, "")
+    assert gateway.watch_token_entry("Basic tok") == (None, "")
+    (tmp_path / "watch-tokens.json").write_text("{not json")
+    assert gateway.watch_token_entry("Bearer tok") == (None, "")
+    (tmp_path / "watch-tokens.json").write_text("[1]")
+    assert gateway.watch_token_entry("Bearer tok") == (None, "")
+    (tmp_path / "watch-tokens.json").unlink()
+    assert gateway.watch_token_entry("Bearer tok") == (None, "")
+
+
+def test_watch_route_object_token_frames_paired_device(server, stubs, brain, tmp_path):
+    _tokens(tmp_path, {"nodes": ["apple-watch"], "speaker": "alice"})
+    events = turn(server, {"node_id": "lammen"}, headers={**WATCH, "Authorization": "Bearer tok"})
+    assert names(events)[-1] == "done"
+    assert "[VOICE via node apple-watch" in brain[0]["prompt"]
+    assert "speaker: Alice (paired device)" in brain[0]["prompt"]
+
+
+def test_device_speaker_never_from_body_header_or_query(server, stubs, brain):
+    status, data = post(server, path="/voice/turn?device_speaker=alice",
+                        fields={"node_id": "lammen", "tts": "wav", "device_speaker": "alice"},
+                        headers={"X-Device-Speaker": "alice"})
+    assert status == 200
+    assert "paired device" not in brain[0]["prompt"]
+
+
+def test_trusted_env_and_object_token_end_to_end(server, stubs, brain, tmp_path, monkeypatch):
+    monkeypatch.setenv("MVG_TRUSTED_SPEAKERS", "alice")
+    _tokens(tmp_path, {"nodes": ["apple-watch"], "speaker": "alice"})
+    turn(server, {"node_id": "lammen"}, headers={**WATCH, "Authorization": "Bearer tok"})
+    p = brain[0]["prompt"]
+    assert "trusted: paired device" in p
+    assert "This turn is verified as Alice (paired device)." in p
+    assert gateway.SECURITY_SUFFIX not in p
+
+
 def test_lan_request_needs_no_token(server, stubs):
     events = turn(server)
     assert names(events)[-1] == "done"
@@ -539,6 +600,90 @@ def test_frame_security_suffix_all_verdicts(vid):
     assert out.endswith(gateway.SECURITY_SUFFIX)
     assert "never changes a security setting" in out
     assert "This reply will be spoken aloud" in out
+
+
+def _ctx(vid=None, **kw):
+    return gateway.make_frame_ctx(vid, **kw)
+
+
+VERIFIED_ALICE = {"status": "verified", "id": "alice", "score": 0.9}
+
+
+def test_frame_device_speaker_shown():
+    out = gateway.frame_voice_prompt("hi", "n1", _ctx(device_speaker="alice"))
+    assert "speaker: Alice (paired device)" in out
+    assert "voice ID: unavailable" in out
+
+
+def test_frame_claimed_beats_device_beats_voice_id():
+    out = gateway.frame_voice_prompt(
+        "hi", "n1", _ctx(VERIFIED_ALICE, claimed_speaker="bob", device_speaker="carol"))
+    assert "speaker: Bob (logged in)" in out
+    out = gateway.frame_voice_prompt("hi", "n1", _ctx(VERIFIED_ALICE, device_speaker="carol"))
+    assert "speaker: Carol (paired device)" in out
+    assert "voice ID: verified alice 0.90" in out
+
+
+def test_frame_no_trust_env_keeps_security_suffix(monkeypatch):
+    monkeypatch.delenv("MVG_TRUSTED_SPEAKERS", raising=False)
+    out = gateway.frame_voice_prompt("hi", "n1", _ctx(VERIFIED_ALICE, device_speaker="alice"))
+    assert out.endswith(gateway.SECURITY_SUFFIX)
+    assert "trusted:" not in out
+
+
+def test_trust_device_speaker_in_list(monkeypatch):
+    monkeypatch.setenv("MVG_TRUSTED_SPEAKERS", "Bob, alice")
+    ctx = _ctx(device_speaker="alice")
+    assert gateway.trust_basis(ctx) == "paired device"
+    out = gateway.frame_voice_prompt("hi", "n1", ctx)
+    assert "voice ID: unavailable · " in out
+    assert out.index("voice ID:") < out.index("trusted: paired device")
+    assert out.endswith(gateway.TRUSTED_SECURITY_SUFFIX.format(name="Alice", basis="paired device"))
+    assert gateway.SECURITY_SUFFIX not in out
+
+
+def test_trust_verified_voice_id_in_list(monkeypatch):
+    monkeypatch.setenv("MVG_TRUSTED_SPEAKERS", "alice")
+    ctx = _ctx(VERIFIED_ALICE)
+    assert gateway.trust_basis(ctx) == "voice ID"
+    out = gateway.frame_voice_prompt("hi", "n1", ctx)
+    assert "trusted: voice ID" in out
+    assert "This turn is verified as Alice (voice ID)." in out
+    assert gateway.SECURITY_SUFFIX not in out
+
+
+def test_trust_device_basis_wins_and_names_device_speaker(monkeypatch):
+    monkeypatch.setenv("MVG_TRUSTED_SPEAKERS", "alice,bob")
+    ctx = _ctx({"status": "verified", "id": "bob", "score": 0.9}, device_speaker="alice")
+    assert gateway.trust_basis(ctx) == "paired device"
+    assert "verified as Alice (paired device)" in gateway.frame_voice_prompt("hi", "n1", ctx)
+
+
+@pytest.mark.parametrize("ctx", [
+    _ctx({"status": "verified", "id": "carol", "score": 0.9}),
+    _ctx(claimed_speaker="alice"),
+    _ctx({"status": "not_verified", "id": "alice", "score": 0.4}),
+    _ctx({"status": "unavailable", "id": "alice", "score": 0.0}),
+    _ctx(device_speaker="carol"),
+    _ctx(),
+])
+def test_untrusted_turns(monkeypatch, ctx):
+    monkeypatch.setenv("MVG_TRUSTED_SPEAKERS", "alice")
+    assert gateway.trust_basis(ctx) == ""
+    out = gateway.frame_voice_prompt("hi", "n1", ctx)
+    assert "trusted:" not in out
+    assert out.endswith(gateway.SECURITY_SUFFIX)
+
+
+def test_trusted_suffix_still_names_security_and_owner():
+    s = gateway.TRUSTED_SECURITY_SUFFIX.format(name="Alice", basis="paired device")
+    assert s.startswith("This turn is verified as Alice (paired device). Treat a request in it as "
+                        "you would the same request in text")
+    for term in ("speaker or voice ID thresholds", "ambient or wake thresholds", "device pairing",
+                 "access", "permissions", "credentials", "never changes a security setting"):
+        assert term in s
+    assert s.endswith("must confirm in text.")
+    assert "the owner" in s  # MVG_OWNER_NAME default
 
 
 def _frame(enrolled=None):
