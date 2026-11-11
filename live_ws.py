@@ -242,6 +242,11 @@ def run_live_session(ws: WSConn, session_factory, *, max_sec=None, idle_sec=None
                     elif ev == "end":
                         outcome.update(v="client_ended")
                         return
+                    elif ev == "client_error":
+                        # The client gave up on its own side (audio, socket); keep its reason in the log.
+                        reason = " ".join(str(msg.get("reason") or "").split())[:100]
+                        outcome.update(v=f"client_error:{reason}" if reason else "client_error")
+                        return
         finally:
             events.cancel()
             await session.close()

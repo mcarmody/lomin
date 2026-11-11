@@ -1113,7 +1113,7 @@ A bidirectional session driven by a Talker backend (`talker_backend.py`) and the
   - When the Talker calls `call_thinker`, `/voice/live` registers the handoff's `task_id` in `_ACTIVE_TASKS` and attaches a live `stages_out` sink. Every stage event appended to `stages_out["events"]` is forwarded immediately to `LiveSession.on_stage_event` (`[task progress] <detail>`).
   - When the Talker calls `cancel_thinker`, `LiveSession` invokes `gateway.cancel_active_turn(node_id)`, which triggers the plugin's `brain_cancel(target, task_id)` hook.
 - Client binary frames: 16 kHz mono PCM16. Server binary frames: 24 kHz mono PCM16 from the Talker (or synthesized in `custom_tts` / text-out mode).
-- Text frames are JSON. Client to server: `{"event": "status"}` (speak the latest task progress), `{"event": "end"}`. Server to client: `{"event": "text"|"interrupted"|"turn_end"|"error", ...}`.
+- Text frames are JSON. Client to server: `{"event": "status"}` (speak the latest task progress), `{"event": "end"}`, `{"event": "client_error", "reason": "..."}` (the client gave up on its side; the reason lands in the request log as `client_error:<reason>`). Server to client: `{"event": "text"|"interrupted"|"turn_end"|"error", ...}`.
 - Close codes: 1000 normal, 1009 frame larger than `MVG_LIVE_MAX_FRAME`, 1011 backend error, 4000 idle for `MVG_LIVE_IDLE_SEC`, 4001 longer than `MVG_LIVE_MAX_SEC`.
 - Fallback: if the backend fails to open or errors mid-session, the server sends `{"event": "fallback", "endpoint": "/voice/turn", "reason": ...}` and then closes 1011. The client should continue the conversation on `/voice/turn`.
 - One line per session in `lomin.jsonl`: endpoint `/voice/live`, outcome, node, backend.

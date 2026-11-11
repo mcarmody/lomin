@@ -590,3 +590,14 @@ def test_live_thinker_frame_carries_device_speaker_and_trust(server, monkeypatch
     assert "speaker: Alice (paired device)" in seen[0][1]
     assert "trusted: paired device" in seen[0][1]
     assert gateway.SECURITY_SUFFIX not in seen[0][1]
+
+
+def test_client_error_event_closes_with_reason(server):
+    c = Client(server)
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "client_error", "reason": "audio: engine\nstopped"}).encode())
+    while True:
+        op, payload = c.recv()
+        if op == live_ws.OP_CLOSE:
+            break
+    assert struct.unpack(">H", payload[:2])[0] == 1000
+    assert payload[2:].decode() == "client_error:audio: engine stopped"
