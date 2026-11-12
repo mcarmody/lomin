@@ -7,6 +7,9 @@ tools so backends stay thin:
   call_thinker(request)              start a brain call, return {"status": "started", "handoff_id": n}
                                      at once; the brain result is sent to the backend as text
                                      tagged with the handoff id. Calls queue one at a time.
+                                     A result or progress line that lands while the Talker is
+                                     mid-turn waits for `turn_end` (send_context), because a
+                                     text message cuts a live model off mid-sentence.
   cancel_thinker()                   cancel the running turn (cancel_turn callback), drop queued calls
   answer_prompt(prompt_id, decision) stub: {"status": "unsupported"}
   set_progress_updates(enabled)      stores `progress_updates` for the progress relay
@@ -138,7 +141,7 @@ class ProgressRelay:
     async def _send(self) -> None:
         line, self.pending = self.pending, None
         self.last_sent = self.clock()
-        await self.session.backend.send_text(line, silent=self.silent)
+        await self.session.send_context(line, silent=self.silent, key="progress")
 
     async def finish(self) -> None:
         """Task end: deliver the latest unsent line now, ignoring the gap."""
@@ -187,6 +190,15 @@ class LiveSession:
         self._worker: asyncio.Task | None = None
         self._running: dict | None = None
         self._closed = False
+        # Context lines (progress, thinker results) wait here while the Talker is
+        # mid-turn: a text message to a live model cuts off what it is saying.
+        self._talker_busy = False
+        self._held: list[tuple[str, bool, str]] = []
+        self._hold_timer = None
+        try:
+            self.hold_max = float(os.environ.get("MVG_LIVE_HOLD_MAX_SEC", "45"))
+        except ValueError:
+            self.hold_max = 45.0
         self.relay = ProgressRelay(self)
 
     # -- progress --
@@ -203,6 +215,38 @@ class LiveSession:
     async def open(self) -> None:
         await self.backend.open(self.config)
         self._worker = asyncio.ensure_future(self._work())
+
+    async def send_context(self, text: str, *, silent: bool = False, key: str = "") -> None:
+        """Give the Talker a harness line (progress, a thinker result). Sent at once
+        when the Talker is idle. Mid-turn it is held until `turn_end`, or for at most
+        MVG_LIVE_HOLD_MAX_SEC, so the Talker finishes its sentence first. A held line
+        with a `key` replaces an older held line with the same key."""
+        if self._closed:
+            return
+        if not self._talker_busy:
+            await self.backend.send_text(text, silent=silent)
+            return
+        if key:
+            self._held = [h for h in self._held if h[2] != key]
+        self._held.append((text, silent, key))
+        if self._hold_timer is None and self.hold_max > 0:
+            self._hold_timer = asyncio.get_running_loop().call_later(
+                self.hold_max, lambda: asyncio.ensure_future(self._hold_expired()))
+
+    async def _hold_expired(self) -> None:
+        self._hold_timer = None
+        self._talker_busy = False
+        await self._release_held()
+
+    async def _release_held(self) -> None:
+        if self._hold_timer is not None:
+            self._hold_timer.cancel()
+            self._hold_timer = None
+        held, self._held = self._held, []
+        for text, silent, _key in held:
+            if self._closed:
+                return
+            await self.backend.send_text(text, silent=silent)
 
     async def feed_text(self, text: str, *, silent: bool = False) -> None:
         if not self._closed and isinstance(text, str) and text.strip():
@@ -270,6 +314,8 @@ class LiveSession:
                     break
             if not self._closed and self.error is None:
                 await self._flush_speech()
+                self._talker_busy = False  # no more events: nothing left to cut off
+                await self._release_held()
         finally:
             self.ended.set()
 
@@ -288,6 +334,10 @@ class LiveSession:
         self._closed = True
         self._clear_speech()
         self.relay.close()
+        if self._hold_timer is not None:
+            self._hold_timer.cancel()
+            self._hold_timer = None
+        self._held = []
         if self._worker is not None:
             self._worker.cancel()
             try:
@@ -309,6 +359,8 @@ class LiveSession:
     async def _dispatch(self, ev: dict) -> bool:
         """False ends the session."""
         kind = ev.get("type") if isinstance(ev, dict) else None
+        if kind in ("audio", "text"):
+            self._talker_busy = True  # it is speaking; cleared at turn_end
         if kind == "tool_call":
             await self._flush_speech()
             result = await self._handle_tool(ev.get("name"), ev.get("args"))
@@ -320,6 +372,8 @@ class LiveSession:
         elif kind == "turn_end":
             await self._flush_speech()
             await self._client(ev)
+            self._talker_busy = False
+            await self._release_held()
         elif kind == "interrupted":
             self._clear_speech()
             await self._client(ev)
@@ -334,6 +388,8 @@ class LiveSession:
                 self.error = str(exc) or "reconnect failed"
                 await self._client({"type": "error", "message": self.error})
                 return False
+            self._talker_busy = False  # the old connection's turn ended with it
+            await self._release_held()
         elif kind == "error":
             self.error = str(ev.get("message") or "backend error")
             await self._client({"type": "error", "message": self.error})
@@ -415,7 +471,7 @@ class LiveSession:
                 self.relay.pending = None
                 continue
             await self.relay.finish()
-            await self.backend.send_text(f"[thinker result, handoff {job['id']}] {text}")
+            await self.send_context(f"[thinker result, handoff {job['id']}] {text}")
 
     @staticmethod
     def _result_text(result: Any) -> str:

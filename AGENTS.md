@@ -15,7 +15,7 @@ Files:
 - `tts_backends.py` — the swappable TTS chain (`MVG_TTS_CHAIN`).
 - `desktop_tts.py`, `desktop_embed.py` — optional GPU-host servers (TTS, speaker embedding), reached over an ssh reverse tunnel.
 - `talker_backend.py` — the Talker contract for live voice (`TalkerBackend`, `MockBackend`, `CascadedTextBackend` (`cascaded`), `load_backend`, `requires`); plugin backends via `MVG_TALKER_BACKENDS=name=module:Class`. Stdlib only.
-- `live_harness.py` — `LiveSession`: drives one Talker backend and owns the coordination tools `call_thinker`, `cancel_thinker`, `answer_prompt` (stub), `set_progress_updates`. Stdlib only; callbacks come from the gateway.
+- `live_harness.py` — `LiveSession`: drives one Talker backend and owns the coordination tools `call_thinker`, `cancel_thinker`, `answer_prompt` (stub), `set_progress_updates`. Progress lines and thinker results go through `send_context`, which holds them while the Talker is speaking and releases them at `turn_end`. Stdlib only; callbacks come from the gateway.
 - `live_ws.py` — stdlib RFC 6455 server framing and the `/voice/live` bridge (`run_live_session`); the route is `_handle_voice_live` in `gateway.py`.
 - `gemini_live.py` — built-in `gemini` Talker backend: stdlib asyncio WebSocket client for the Gemini Live API; the four coordination tools are declared as function declarations.
 - `sentence_segmenter.py`, `text_utils.py`, `multipart.py`, `audio_utils.py`, `t3_fast.py` — helpers.

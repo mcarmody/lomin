@@ -234,6 +234,7 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_GEMINI_API_KEY` / `MVG_GEMINI_MODEL` / `MVG_GEMINI_VOICE` / `MVG_GEMINI_INSTRUCTIONS` / `MVG_GEMINI_URL` | unset / `gemini-3.8-live` / unset / unset / Google endpoint — settings for the built-in `gemini` Talker backend (`MVG_TALKER_BACKEND=gemini`, `gemini_live.py`); the key is required, `MVG_GEMINI_URL` overrides the endpoint |
 | `MVG_TALKER_URL` / `MVG_TALKER_MODEL` / `MVG_TALKER_KEY` / `MVG_TALKER_TIMEOUT` / `MVG_TALKER_INSTRUCTIONS` | unset / `gpt-4o-mini` / unset / `15` / built-in prompt — settings for the built-in `cascaded` text-in/text-out Talker backend (`MVG_TALKER_BACKEND=cascaded`, `talker_backend.py`) |
 | `MVG_LIVE_MAX_SEC` / `MVG_LIVE_IDLE_SEC` / `MVG_LIVE_MAX_FRAME` | `600` / `30` / `262144` — session length, idle timeout (seconds) and largest client frame (bytes) for `/voice/live` |
+| `MVG_LIVE_HOLD_MAX_SEC` | `45` — longest a progress line or thinker result waits for the Talker to finish its turn before it is sent anyway (`0`: wait for `turn_end` with no limit) |
 | `MVG_SPOKEN_CANCEL` | `0` — `1` makes a spoken "stop" / "cancel that" on `/voice/turn` cancel the running turn (see Cancel) |
 | `MVG_CANCEL_PHRASES` | `stop,cancel,cancel that,never mind,nevermind,stop that` — comma list of exact cancel phrases |
 | `MVG_CONTEXT_OPENER` | `0` — `1` speaks "One moment, <detail>" from the first stage event in place of the generic opener clip (see Context opener) |
@@ -889,7 +890,9 @@ Events: `turn{turn_id,node_id}`, `state{state: transcribing|classifying|thinking
 Profiles (`nodes.json`): `target`, `targets`, `open_room`, `identify`, `speech_gate`,
 `gap_fill`, `reply_cap_words`, `audio_chunk`, `capture_audio`, `device`, `medium`
 (the last two are the node's default device/medium tags, overridden by the
-request). Read per request.
+request), and for `/voice/live`: `voice_mode`, `talker_backend`, `live_voice`
+(the Talker's voice name; `MVG_GEMINI_VOICE` wins) and `live_reply_cap_words`
+(word cap framed onto a hand-off; default `reply_cap_words`). Read per request.
 
 Room ear: set `hub_url` to `http://<gateway>:9098/api/voice/interact?node_id=<gateway-host>-bench`
 (or `/voice/turn?...`; `/api/voice/interact` is an alias so the ear's derived
@@ -1111,6 +1114,7 @@ A bidirectional session driven by a Talker backend (`talker_backend.py`) and the
   - When the server sends a `sessionResumptionUpdate` (`resumable: true`), the backend stores `newHandle`. On a `goAway` frame (`{"type": "reconnect"}`), `LiveSession` automatically calls `backend.reconnect()` to reopen the WebSocket and resume with the saved handle.
 - **Stage-event relay & task cancellation:**
   - When the Talker calls `call_thinker`, `/voice/live` registers the handoff's `task_id` in `_ACTIVE_TASKS` and attaches a live `stages_out` sink. Every stage event appended to `stages_out["events"]` is forwarded immediately to `LiveSession.on_stage_event` (`[task progress] <detail>`).
+  - A progress line or thinker result that lands while the Talker is speaking is held and sent at its `turn_end` (`LiveSession.send_context`), at most `MVG_LIVE_HOLD_MAX_SEC` later. A text message to a live model interrupts its current generation, so an unheld result cut the Talker off mid-sentence. Only the newest held progress line is kept.
   - When the Talker calls `cancel_thinker`, `LiveSession` invokes `gateway.cancel_active_turn(node_id)`, which triggers the plugin's `brain_cancel(target, task_id)` hook.
 - Client binary frames: 16 kHz mono PCM16. Server binary frames: 24 kHz mono PCM16 from the Talker (or synthesized in `custom_tts` / text-out mode).
 - Text frames are JSON. Client to server: `{"event": "status"}` (speak the latest task progress), `{"event": "end"}`, `{"event": "client_error", "reason": "..."}` (the client gave up on its side; the reason lands in the request log as `client_error:<reason>`). Server to client: `{"event": "text"|"interrupted"|"turn_end"|"error", ...}`.

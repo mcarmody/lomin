@@ -269,6 +269,33 @@ def test_voice_mode_validation(server, monkeypatch):
     assert InspectBackend.last_instance.opened_with["voice_mode"] == "custom_tts"
 
 
+def test_node_live_voice_reaches_backend_config(server, monkeypatch):
+    monkeypatch.setenv("MVG_TALKER_BACKENDS", "inspect=test_live_ws:InspectBackend")
+    monkeypatch.setenv("MVG_TALKER_BACKEND", "inspect")
+
+    monkeypatch.setattr(gateway, "resolve_profile", lambda nid: {"target": "agent", "live_voice": " Charon "})
+    c = Client(server)
+    assert c.status == 101
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c.recv()
+    assert InspectBackend.last_instance.opened_with["live_voice"] == "Charon"
+
+    monkeypatch.setattr(gateway, "resolve_profile", lambda nid: {"target": "agent", "live_voice": ""})
+    c = Client(server)
+    assert c.status == 101
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())
+    c.recv()
+    assert "live_voice" not in InspectBackend.last_instance.opened_with
+
+
+def test_live_reply_cap_prefers_live_key_then_node_cap_then_default():
+    assert gateway.live_reply_cap({"live_reply_cap_words": 110, "reply_cap_words": 60}) == 110
+    assert gateway.live_reply_cap({"live_reply_cap_words": None, "reply_cap_words": 45}) == 45
+    assert gateway.live_reply_cap({"live_reply_cap_words": "junk", "reply_cap_words": 45}) == 45
+    assert gateway.live_reply_cap({}) == gateway.PROFILE_DEFAULTS["reply_cap_words"]
+    assert gateway.live_reply_cap({"live_reply_cap_words": 0, "reply_cap_words": -3}) == 60
+
+
 def test_talker_instructions_hook_and_persona_fallback(server, monkeypatch, tmp_path):
     monkeypatch.setenv("MVG_TALKER_BACKENDS", "inspect=test_live_ws:InspectBackend")
     monkeypatch.setenv("MVG_TALKER_BACKEND", "inspect")

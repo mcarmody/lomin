@@ -102,7 +102,7 @@ server's in-process Piper fallback — then this host's own local Piper binary
 
 Per-node brain routing: node_id picks the profile in nodes.json (MVG_NODES_FILE,
 default $MVG_HOME/nodes.json; target, open_room, identify, speech_gate,
-gap_fill, reply_cap_words, audio_chunk); MVG_NODE_TARGETS (a JSON object, env)
+gap_fill, reply_cap_words, live_reply_cap_words, live_voice, audio_chunk); MVG_NODE_TARGETS (a JSON object, env)
 overrides a node's target. If nodes.json is absent the old node-targets.json
 ({node: target}) is read instead. Any node_id not in the mapping falls back to
 DEFAULT_TARGET (MVG_DEFAULT_TARGET, default "agent"). A node may list `targets`,
@@ -1750,6 +1750,8 @@ PROFILE_DEFAULTS = {
     "speech_gate": True,
     "gap_fill": True,
     "reply_cap_words": 60,
+    "live_reply_cap_words": None,  # /voice/live hand-offs; None -> reply_cap_words
+    "live_voice": "",        # /voice/live Talker voice name (gemini backend); "" -> backend default
     "audio_chunk": False,    # also emit the hub-dialect `audio_chunk` events (ear)
     "capture_audio": False,  # opt-in: save gated turn audio + sidecar for enrollment
     "device": "",            # what the speaker holds/stands at, e.g. iphone (request overrides)
@@ -1830,6 +1832,19 @@ def resolve_profile(node_id: str) -> dict:
     if os.environ.get("MVG_SPEAKER_ID", "1") == "0":
         prof["identify"] = False  # global off switch: no speaker ID on any node
     return prof
+
+
+def live_reply_cap(profile: dict) -> int:
+    """Word cap framed onto a /voice/live hand-off: the node's `live_reply_cap_words`,
+    else its `reply_cap_words`. The Talker relays the reply, so a node may allow more."""
+    for key in ("live_reply_cap_words", "reply_cap_words"):
+        try:
+            n = int(profile.get(key) or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            return n
+    return int(PROFILE_DEFAULTS["reply_cap_words"])
 
 
 def resolve_target(node_id: str) -> str:
@@ -4673,7 +4688,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             tid = task["task_id"]
             stages_out = _LiveStageSink(_forward_stage_event)
             _STAGE_SINK.stages = stages_out
-            _FRAME_CTX.ctx = make_frame_ctx(None, device_speaker=device_speaker)
+            _FRAME_CTX.ctx = make_frame_ctx(None, device_speaker=device_speaker,
+                                            reply_cap_words=live_reply_cap(profile))
             try:
                 use_stream = (
                     BRAIN_CALL is default_brain_call
@@ -4715,6 +4731,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             cfg = {"node_id": node_id, "target": target, "voice_mode": voice_mode}
             if instr:
                 cfg["instructions"] = instr
+            if str(profile.get("live_voice") or "").strip():
+                cfg["live_voice"] = str(profile["live_voice"]).strip()
             sess = live_harness.LiveSession(
                 backend_cls(), cfg, send_to_client, brain,
                 getattr(sys.modules[__name__], "cancel_active_turn", None),
