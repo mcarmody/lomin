@@ -1080,6 +1080,9 @@ When `MVG_DEVICE_TOKENS` is configured, Lomin enforces Bearer token authenticati
   - Failed authentication attempts are tracked per client IP address.
   - After `MVG_AUTH_MAX_FAILURES` (default 5) consecutive failures within `MVG_AUTH_LOCKOUT_SEC` (default 60s), subsequent requests are immediately rejected with HTTP 429 Too Many Requests until the lockout window expires.
   - Successful authentication clears the failure history for the client.
+- **Trusted peers (`MVG_AUTH_TRUSTED_NETS`):** comma-separated CIDRs, for example `127.0.0.0/8,::1/128,172.18.0.0/16`. A request whose TCP peer address is inside one of them, and that carries neither `X-Forwarded-For` nor `X-Real-IP`, skips the token check and counts as Home Assistant authorized. Unset or empty: nobody is exempt. A bad entry is ignored. A request relayed by a proxy is never exempt, so an internet request forwarded by nginx still needs its token (or the watch-route token).
+- **Watch route:** a `/voice/turn` request carrying `X-Watch-Route` is authorized against the watch-token file only and does not also need a `MVG_DEVICE_TOKENS` entry.
+- **Monitor mode (`MVG_AUTH_MONITOR=1`):** with `MVG_DEVICE_TOKENS` set, a request that would be refused is let through and logged as `would_reject`; accepted requests are logged as `ok_token` or `ok_exempt`. Each decision is one JSON line `{ts, endpoint, peer, node, outcome}` on stdout and, when `MVG_AUTH_LOG` names a file, appended to that file. Outside monitor mode only `rejected` and `locked_out` are logged.
 
 ### Deferred Voice Answers (`MVG_ENABLE_DEFER`)
 

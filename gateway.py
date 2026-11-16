@@ -169,6 +169,7 @@ import hashlib
 import hmac
 import importlib
 import inspect
+import ipaddress
 import json
 import math
 import os
@@ -264,11 +265,15 @@ def _is_ha_authorized(
     speaker_score: Any = None,
     voice_id: dict | None = None,
     claimed_speaker: str = "",
+    peer_trusted: bool = False,
 ) -> bool:
     """Verify whether caller is authorized to execute Home Assistant control."""
+    if peer_trusted:
+        return True
     ha_intent_token = os.environ.get("MVG_HA_INTENT_TOKEN", "").strip()
     device_verifier = get_device_token_verifier()
-    tokens_configured = bool(ha_intent_token) or device_verifier.is_enabled
+    tokens_configured = bool(ha_intent_token) or (
+        device_verifier.is_enabled and not _auth_monitor())
     if not tokens_configured:
         return True
 
@@ -1224,6 +1229,57 @@ def _log_line(path: Path, record: dict) -> None:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+# --- Endpoint auth: trusted peers and monitor mode -----------------------
+# MVG_AUTH_TRUSTED_NETS: comma-separated CIDRs (for example
+# "127.0.0.0/8,::1/128,172.18.0.0/16"). A request whose TCP peer is inside one
+# of them, and that carries no proxy header, skips the MVG_DEVICE_TOKENS check.
+# Unset or empty: nobody is exempt (the old behaviour).
+# MVG_AUTH_MONITOR=1: with MVG_DEVICE_TOKENS set, a request that would be
+# refused is let through and logged as "would_reject"; every decision is logged.
+# MVG_AUTH_LOG: optional file; one JSON line per logged decision (the same
+# line also goes to stdout).
+
+def _trusted_nets() -> list:
+    nets = []
+    for part in os.environ.get("MVG_AUTH_TRUSTED_NETS", "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            continue  # a bad entry exempts nobody
+    return nets
+
+
+def _ip_is_trusted(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return any(addr.version == net.version and addr in net for net in _trusted_nets())
+
+
+def _auth_monitor() -> bool:
+    return os.environ.get("MVG_AUTH_MONITOR", "").strip() == "1"
+
+
+def _auth_event(endpoint: str, peer: str, node: str, outcome: str) -> None:
+    rec = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "endpoint": endpoint,
+        "peer": peer,
+        "node": node,
+        "outcome": outcome,
+    }
+    print("[lomin] auth " + json.dumps(rec), flush=True)
+    path = os.environ.get("MVG_AUTH_LOG", "").strip()
+    if path:
+        _log_line(Path(path), rec)
 
 
 # Old stage endpoints kept for one release; every call is flagged in the
@@ -2929,20 +2985,51 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     return ip
         return node_id or "127.0.0.1"
 
+    def _peer_ip(self) -> str:
+        """The TCP peer address only. Never read from a header."""
+        ca = getattr(self, "client_address", None)
+        if isinstance(ca, (tuple, list)) and ca:
+            return str(ca[0]).strip()
+        return ""
+
+    def _peer_exempt(self) -> bool:
+        """True when the TCP peer is in MVG_AUTH_TRUSTED_NETS and the request
+        was not relayed by a proxy (nginx sets X-Forwarded-For and X-Real-IP, so
+        a request it forwards from the internet is never exempt)."""
+        if not _trusted_nets():
+            return False
+        hdrs = getattr(self, "headers", None)
+        if hdrs is not None and (hdrs.get("X-Forwarded-For") or hdrs.get("X-Real-IP")):
+            return False
+        return _ip_is_trusted(self._peer_ip())
+
     def _check_bearer_auth(self, node_id: str = "", endpoint: str = "", t0: float = 0.0) -> bool:
         verifier = get_device_token_verifier()
         if not verifier.is_enabled:
             return True
+        monitor = _auth_monitor()
+        peer = self._peer_ip()
+        if self._peer_exempt():
+            if monitor:
+                _auth_event(endpoint, peer, node_id, "ok_exempt")
+            return True
         client_id = self._get_client_id(node_id)
         auth_header = self.headers.get("Authorization", "")
         if verifier.verify(auth_header, node_id):
+            if monitor:
+                _auth_event(endpoint, peer, node_id, "ok_token")
+            return True
+        if monitor:
+            _auth_event(endpoint, peer, node_id, "would_reject")
             return True
         if verifier.is_locked_out(client_id):
+            _auth_event(endpoint, peer, node_id, "locked_out")
             self._send_json(429, {"error": "too many failed attempts, locked out"})
             if t0:
                 log_request(endpoint, (time.time() - t0) * 1000, "error:locked_out", node=node_id)
             return False
         verifier.record_failure(client_id)
+        _auth_event(endpoint, peer, node_id, "rejected")
         self._send_json(401, {"error": "unauthorized"})
         if t0:
             log_request(endpoint, (time.time() - t0) * 1000, "error:unauthorized", node=node_id)
@@ -3505,6 +3592,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             speaker=speaker,
             speaker_score=req.get("speaker_score"),
             claimed_speaker=claimed,
+            peer_trusted=self._peer_exempt(),
         )
         fast = _intent(text, ha_authorized=ha_auth)
         if not fast["hit"]:
@@ -3997,6 +4085,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         speaker_score=speaker_score,
                         voice_id=ctx.get("voice_id"),
                         claimed_speaker=ctx.get("claimed_speaker", ""),
+                        peer_trusted=self._peer_exempt(),
                     )
                 fast = opts.get("intent_result") or _intent(
                     prompt, has_images=has_vision, ha_authorized=ha_auth
@@ -4298,7 +4387,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         node_id = forced_node or requested_node
         _set_req_node(node_id)
 
-        if not self._check_bearer_auth(node_id, "/voice/turn", t0):
+        # A watch-route request was already authorised above against the watch
+        # token file; the device-token check is for the direct (non-proxied) route.
+        if self.headers.get("X-Watch-Route") is None and not self._check_bearer_auth(
+                node_id, "/voice/turn", t0):
             return
 
         if enable_adpcm and wav_bytes:
