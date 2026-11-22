@@ -44,6 +44,7 @@ Every hook is optional:
 - `apply_defaults()` — fill env defaults with `setdefault` before config reads them.
 - `brain_call(target, prompt, timeout) -> str` — the agent answers one framed prompt.
 - `brain_cancel(target, task_id) -> bool` — abort a running brain call; `cancel_active_turn(node_id)` in `gateway.py` uses it.
+- `on_reply_kept(node_id, reply_id, target, text)`: optional. Called once from a daemon thread when `MVG_KEEP_REPLY_NODES` lists the node and its reply finished after the client left.
 - `brain_call_stream(target, prompt, timeout, on_partial, stages_out, *, task_id=None, audio_clips=None) -> str` — streaming brain. Optional keywords `task_id` and `audio_clips` (list of WAV bytes when `MVG_SPLICE_RAW_AUDIO=1`) are passed only if the signature accepts them.
 - `talker_instructions(target, node_id) -> str | None` — system instructions for `/voice/live` Talker sessions, checked before `<MVG_PERSONA_DIR>/<target>/voice_talker.md` and `voice.md`.
 - `classify` — a module with `classify_choice(...)` (the addressee classifier).

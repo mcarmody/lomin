@@ -27,6 +27,7 @@ MVG_BRAIN=http MVG_BRAIN_URL=http://127.0.0.1:8000/brain python3 gateway.py
 | `brain_call(target, prompt, timeout)` | `-> str` | the agent answers one framed prompt | `MVG_BRAIN` defaults to `http` (`POST $MVG_BRAIN_URL`) |
 | `brain_call_stream(target, prompt, timeout, on_partial, stages_out, *, task_id=None, audio_clips=None)` | `-> str` | streaming brain: call `on_partial(text_so_far)` as the reply grows; receives `task_id` for cancellation and `audio_clips` (16 kHz WAV bytes) when `MVG_SPLICE_RAW_AUDIO=1` | falls back to single-shot `brain_call` (or `http` streaming when `MVG_BRAIN=http`); omitting `task_id` or `audio_clips` from the signature simply skips passing that keyword |
 | `brain_cancel(target, task_id)` | `-> bool` | optional: abort the running brain call with that task id; truthy = it was stopped | cancel stops speech and drops the result (`"stopped_speech_only"`), but cannot abort the upstream brain call |
+| `on_reply_kept(node_id, reply_id, target, text)` | `-> None` | optional: called once, in a daemon thread, when a kept reply is ready | the reply is still kept and nothing is called |
 | `talker_instructions(target, node_id)` | `-> str \| None` | optional: return the system instructions for a `/voice/live` Talker session on `node_id` targeting `target` | gateway checks `<MVG_PERSONA_DIR>/<target>/voice_talker.md`, then `voice.md`, then `MVG_GEMINI_INSTRUCTIONS` / `MVG_TALKER_INSTRUCTIONS` |
 | `classify` | module with `classify_choice(...)` | addressee classifier for `/ambient` and open rooms | `/ambient` uses `name-only` matching (engages when the transcript names the agent) |
 | `try_intent(text)` | `-> dict \| None` | deterministic fast path; see "Fast path" below | fast path is skipped (`intent: "miss"`); every turn goes to the brain |
@@ -36,6 +37,8 @@ MVG_BRAIN=http MVG_BRAIN_URL=http://127.0.0.1:8000/brain python3 gateway.py
 See [`examples/reference_plugin.py`](examples/reference_plugin.py) and [`examples/README.md`](examples/README.md) for a complete, zero-dependency reference plugin (in-memory or configurable HTTP via `REF_PLUGIN_BRAIN_URL`) implementing `brain_call_stream`, `brain_cancel`, and `talker_instructions`.
 
 **Cancel.** Each `/voice/turn`, `/ask/stream`, and `/voice/live` (`call_thinker`) brain call gets a 12-character `task_id` and is registered as its node's active task until it ends (success, error or cancel). `gateway.cancel_active_turn(node_id)` returns `"cancelled"` (the `brain_cancel` hook ran and returned truthy), `"stopped_speech_only"` (no hook, or it returned falsy or raised: the turn stops synthesising, drops the result and ends with outcome `cancelled`) or `"no_active_turn"` (nothing running, or already cancelled). With `MVG_SPOKEN_CANCEL=1` a spoken cancel on `/voice/turn` calls it (see below); on `/voice/live` the `cancel_thinker` tool calls it.
+
+**Kept replies.** With `MVG_KEEP_REPLY_NODES` listing a node, a `/voice/turn` whose client leaves during the brain stage is not dropped. The gateway lets the brain call finish, keeps the reply in memory and calls the plugin's `on_reply_kept` hook. A later `/voice/turn` with a `reply_id` field and no audio speaks the kept reply on the usual SSE stream. An unknown, expired or foreign id answers 404 `reply_expired`. A request with both `reply_id` and audio answers 400.
 
 **Spoken cancel.** `MVG_SPOKEN_CANCEL=1` (default off): after STT on `/voice/turn`, a transcript that is exactly one of the cancel phrases (`stop`, `cancel`, `cancel that`, `never mind`, `nevermind`, `stop that`; override with the comma list `MVG_CANCEL_PHRASES`) or at most 3 words starting with `stop` or `cancel` calls `cancel_active_turn(node_id)`. The reply is a fixed, normally synthesised acknowledgement: `Cancelled.` or `Stopped talking, but the task may still be running.`. With no active turn the transcript is an ordinary turn. Matching is whole-utterance, never a substring, so "stop the deploy script from restarting" goes to the brain. The turn record carries `intent: "cancel"`.
 
@@ -199,6 +202,9 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_TRANSCRIPT_AUTH_TOKEN` | unset — bearer token sent as `Authorization: Bearer <token>` with requests to `MVG_TRANSCRIPT_SINK_URL` |
 | `MVG_TRANSCRIPT_LOG_PATH` | unset — file path to append turn transcript JSONL records with strict `0o600` permissions and automated rotation |
 | `MVG_TRANSCRIPT_MAX_BYTES` | `10485760` (10 MiB) — size cap for `MVG_TRANSCRIPT_LOG_PATH` before rotating the log file to `.1` |
+| `MVG_KEEP_REPLY_NODES` | unset (off). Comma separated node ids whose `/voice/turn` replies are kept when the client leaves before the reply ends |
+| `MVG_KEPT_REPLY_TTL_SEC` | `3600`. How long a kept reply can be spoken. Memory only; a restart clears it |
+| `MVG_KEPT_REPLY_WAIT_SEC` | `330`. How long the gateway waits for the brain call to end after the client left |
 | `MVG_SIDE_CHANNEL_QUEUE_SIZE` | `1000` — maximum bounded task capacity for the background side-channel webhook and transcript worker queue |
 | `MVG_PLUGIN` | unset — module name of the plugin (see "Plugin") |
 | `MVG_BRAIN` | `plugin` when the plugin has `brain_call`, else `http` — `plugin` or `http` |

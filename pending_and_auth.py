@@ -285,6 +285,35 @@ class PendingVoiceAnswerStore:
                 return None
             return dict(q[0])
 
+    def get(self, node_id: str, record_id: str, max_age_sec: float | None = None) -> dict[str, Any] | None:
+        """Return the record with this id for node_id without removing it, or None.
+        None too when it is older than max_age_sec (when given)."""
+        clean_node = (node_id or "").strip()
+        clean_id = (record_id or "").strip()
+        if not clean_node or not clean_id:
+            return None
+        with self._lock:
+            for item in self._store.get(clean_node, ()):
+                if item["id"] == clean_id:
+                    if max_age_sec is not None and time.time() - item["created_at"] > max_age_sec:
+                        return None
+                    return dict(item)
+        return None
+
+    def purge(self, max_age_sec: float) -> int:
+        """Drop every record older than max_age_sec, for every node. Returns how many were dropped."""
+        dropped = 0
+        with self._lock:
+            for node in list(self._store):
+                q = self._store[node]
+                fresh = [i for i in q if time.time() - i["created_at"] <= max_age_sec]
+                dropped += len(q) - len(fresh)
+                if fresh:
+                    self._store[node] = collections.deque(fresh, maxlen=self._max_per_node)
+                else:
+                    del self._store[node]
+        return dropped
+
     def count_for_node(self, node_id: str) -> int:
         """Return the count of pending answers for node_id."""
         clean_node = (node_id or "").strip()
@@ -309,6 +338,16 @@ _DEFAULT_VERIFIER = BearerTokenVerifier()
 def get_pending_store() -> PendingVoiceAnswerStore:
     """Return the global PendingVoiceAnswerStore singleton."""
     return _DEFAULT_STORE
+
+
+# Replies kept for a client that went away (gateway.py keep_reply_when_done). A second instance, so the
+# default store, which /voice/pending pops by node, never hands one out.
+_KEPT_STORE = PendingVoiceAnswerStore(max_per_node=20)
+
+
+def get_kept_store() -> PendingVoiceAnswerStore:
+    """Return the store of replies kept for a client that went away."""
+    return _KEPT_STORE
 
 
 def get_device_token_verifier() -> BearerTokenVerifier:

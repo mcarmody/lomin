@@ -221,6 +221,7 @@ from pending_and_auth import (  # noqa: E402,F401
     BearerTokenVerifier,
     PendingVoiceAnswerStore,
     get_device_token_verifier,
+    get_kept_store,
     get_pending_store,
     has_defer_marker,
     is_defer_enabled,
@@ -251,6 +252,7 @@ _PLUGIN_MOD = _plugin
 _plugin_brain_call = getattr(_plugin, "brain_call", None)
 _plugin_brain_call_stream = getattr(_plugin, "brain_call_stream", None)
 _plugin_brain_cancel = getattr(_plugin, "brain_cancel", None)
+_plugin_on_reply_kept = getattr(_plugin, "on_reply_kept", None)
 _plugin_talker_instructions = getattr(_plugin, "talker_instructions", None)
 # Kept as `_jev_classifier`: test_ambient.py monkeypatches its attributes.
 _jev_classifier = getattr(_plugin, "classify", None)
@@ -2330,6 +2332,68 @@ def _unregister_task(node_id: str, task: dict) -> None:
             del _ACTIVE_TASKS[node_id or ""]
 
 
+def keep_reply_enabled(node_id: str) -> bool:
+    """True when MVG_KEEP_REPLY_NODES (comma separated node ids) lists this node. Unset or empty: off."""
+    if not node_id:
+        return False
+    listed = {n.strip() for n in os.environ.get("MVG_KEEP_REPLY_NODES", "").split(",") if n.strip()}
+    return node_id in listed
+
+
+def kept_reply_ttl_sec() -> float:
+    """Seconds a kept reply can be spoken again (MVG_KEPT_REPLY_TTL_SEC, default 3600)."""
+    try:
+        return max(0.0, float(os.environ.get("MVG_KEPT_REPLY_TTL_SEC", "3600")))
+    except ValueError:
+        return 3600.0
+
+
+def kept_reply_wait_sec() -> float:
+    """Seconds the keep thread waits for the brain call to end (MVG_KEPT_REPLY_WAIT_SEC, default 330)."""
+    try:
+        return max(0.0, float(os.environ.get("MVG_KEPT_REPLY_WAIT_SEC", "330")))
+    except ValueError:
+        return 330.0
+
+
+def kept_reply_text(result: dict) -> tuple[str, str]:
+    """(speakable, stored) for a finished brain call, or ("", "") when there is nothing to keep
+    (an error, an unanswered turn, the silent sentinel, an empty reply). `speakable` is the markdown stripped
+    text for the hook. `stored` keeps the markdown and drops the defer marker, so a replay runs the live path."""
+    if "error" in result:
+        return "", ""
+    raw = result.get("reply") or ""
+    if raw.startswith("unanswered:") or is_silent_sentinel(raw) or not raw.strip():
+        return "", ""
+    return strip_defer_marker(strip_markdown(raw)).strip(), strip_defer_marker(raw).strip()
+
+
+def keep_reply_when_done(*, node_id: str, prompt: str, target: str, done_event: threading.Event,
+                         result_box: dict, intent_rec: dict, check_fast_path: bool, timeout: float) -> None:
+    """Thread body. Waits once for the brain call to end, keeps its reply for the node and calls the plugin's
+    on_reply_kept(node_id, reply_id, target, text). Never raises."""
+    try:
+        if not done_event.wait(timeout):
+            log_request("/voice/turn/kept", 0.0, "kept_reply:timeout", node=node_id)
+            return
+        if check_fast_path and intent_rec.get("intent") != "miss":  # a fast path answer is not worth a notification
+            log_request("/voice/turn/kept", 0.0, "kept_reply:fast_path", node=node_id)
+            return
+        text, stored = kept_reply_text(result_box)
+        if not text:
+            log_request("/voice/turn/kept", 0.0, "kept_reply:none", node=node_id)
+            return
+        get_kept_store().purge(kept_reply_ttl_sec())
+        record = get_kept_store().store(node_id=node_id, prompt=prompt, answer=stored)
+        log_request("/voice/turn/kept", 0.0, "kept_reply:stored", node=node_id,
+                    reply_id=record["id"], chars=len(text))
+        hook = _plugin_on_reply_kept
+        if hook is not None:
+            hook(node_id, record["id"], target, text)
+    except Exception as exc:  # a daemon thread must not die loudly
+        log_fallback(f"kept_reply_failed:{str(exc)[:200]}", tts_engine="kept-skip")
+
+
 def _resolve_talker_instructions(target: str, node_id: str) -> str | None:
     """Resolve system instructions for a live Talker session.
 
@@ -3883,7 +3947,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             rec.update(_correlated_stt(node_id, t0))
             _gap_turn_done(gap["used"])
             log_latency(rec)
-            if os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH"):
+            if (os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH")) and not opts.get("no_transcript"):
                 transcript_rec = dict(rec)
                 transcript_rec["prompt"] = prompt
                 transcript_rec["transcript"] = prompt
@@ -4138,11 +4202,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
+        def _keep_after_client_gone() -> None:
+            """The client went away. For an opted-in node, let the brain call finish and keep its reply."""
+            if (endpoint != "/voice/turn" or opts.get("no_keep") or not keep_reply_enabled(node_id)
+                    or cancel_event.is_set()):
+                return
+            cancel_event.set()  # nothing more is cut into sentences or spoken for a client that is gone
+            threading.Thread(
+                target=keep_reply_when_done, name="kept-reply", daemon=True,
+                kwargs={"node_id": node_id, "prompt": prompt, "target": target, "done_event": done_event,
+                        "result_box": result_box, "intent_rec": intent_rec,
+                        "check_fast_path": not opts.get("intent_result"), "timeout": kept_reply_wait_sec()},
+            ).start()
+
         if voice and not self._sse("state", {"state": "thinking"}):
             executor.shutdown(wait=False, cancel_futures=True)
+            _keep_after_client_gone()
             return ("error:client_gone", "")
         if not self._sse("status", {"status": "thinking"}):
             executor.shutdown(wait=False, cancel_futures=True)
+            _keep_after_client_gone()
             return ("error:client_gone", "")
 
         def _drain_ready(next_idx: int) -> "int | None":
@@ -4232,6 +4311,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if client_gone:
             executor.shutdown(wait=False, cancel_futures=True)
             _finish("error:client_gone")
+            _keep_after_client_gone()
             return ("error:client_gone", "")
 
         if cancel_event.is_set():
@@ -4290,6 +4370,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         executor.shutdown(wait=True)
         if idx is None:
             _finish("error:client_gone")
+            _keep_after_client_gone()
             return ("error:client_gone", reply)
         if outcome == "ok":
             # Follow-up window counts from the end of playback, not from
@@ -4321,6 +4402,39 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
     # -- /voice/turn (SSE): the whole pipeline, one request per utterance --
+
+    def _replay_kept_reply(self, *, t0, node_id, reply_id, requested_target, tts, session_id):
+        """POST /voice/turn with `reply_id` and no audio: speak a reply kept for this node, on the same SSE
+        stream as a live turn. No transcription, no brain call. The caller was authorised above."""
+        item = None
+        if keep_reply_enabled(node_id):
+            item = get_kept_store().get(node_id, reply_id, kept_reply_ttl_sec())
+        if item is None:
+            self._send_json(404, {"error": "reply_expired"})
+            log_request("/voice/turn", (time.time() - t0) * 1000, "error:reply_expired", node=node_id)
+            return
+        if tts not in ("stream", "wav", "none"):
+            self._send_json(400, {"error": "tts must be stream, wav or none"})
+            log_request("/voice/turn", (time.time() - t0) * 1000, "error:bad_tts", node=node_id)
+            return
+        prof = resolve_profile(node_id)
+        target = resolve_request_target(node_id, requested_target)
+        turn_id = str(uuid.uuid4())
+        ctx = make_frame_ctx(None, open_room=False, reply_cap_words=int(prof["reply_cap_words"]), target=target)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if not self._sse("turn", {"turn_id": turn_id, "node_id": node_id}):
+            return
+        self._stream_brain_turn(
+            t0=t0, turn_id=turn_id, prompt=item["prompt"], session_id=session_id, node_id=node_id,
+            speaker="", speaker_score=None, ctx=ctx, endpoint="/voice/turn",
+            opts={"voice": True, "tts": tts, "gap_fill": False, "audio_chunk": bool(prof["audio_chunk"]),
+                  "no_keep": True, "no_transcript": True,
+                  "intent_result": {"hit": True, "intent": "kept_reply", "match_ms": 0.0, "handler_ms": 0.0,
+                                    "reply": item["answer"], "reason": "kept_reply"}},
+            log_extra={"node": node_id, "replay": True})
 
     def _handle_voice_turn(self):
         t0 = time.time()
@@ -4480,6 +4594,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "node_id required"})
             log_request("/voice/turn", (time.time() - t0) * 1000, "error:no_node")
             return
+        reply_id = (opt("reply_id") or "").strip()
+        if reply_id and wav_bytes:
+            self._send_json(400, {"error": "reply_id and audio are exclusive"})
+            log_request("/voice/turn", (time.time() - t0) * 1000, "error:reply_id_with_audio", node=node_id)
+            return
+        if reply_id:
+            return self._replay_kept_reply(
+                t0=t0, node_id=node_id, reply_id=reply_id, requested_target=opt("target"),
+                tts=(opt("tts") or "stream").lower(), session_id=opt("session_id") or "")
         if not wav_bytes:
             self._send_json(400, {"error": "no audio payload found"})
             log_request("/voice/turn", (time.time() - t0) * 1000, "error:no_audio", node=node_id)
@@ -4658,6 +4781,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 turn_opts["intent_result"] = {"hit": True, "intent": "cancel", "match_ms": 0.0,
                                               "handler_ms": 0.0, "reply": ack, "reason": "spoken_cancel"}
                 turn_opts["gap_fill"] = False
+                turn_opts["no_keep"] = True  # "Cancelled." is not a reply worth a notification
         self._stream_brain_turn(
             t0=t0, turn_id=turn_id, prompt=transcript, session_id=session_id, node_id=node_id,
             speaker=speaker_id, speaker_score=vid.get("score"), ctx=ctx, endpoint="/voice/turn",
