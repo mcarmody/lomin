@@ -54,6 +54,8 @@ class FailBackend(tb.MockBackend):
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
+    # These tests list every frame the client gets; the state-frame test turns the frames back on.
+    monkeypatch.setenv("MVG_LIVE_STATE_EVENTS", "0")
     monkeypatch.delenv("MVG_DEVICE_TOKENS", raising=False)
     monkeypatch.setenv("MVG_TALKER_BACKEND", "echo")
     monkeypatch.setenv("MVG_TALKER_BACKENDS", "echo=test_live_ws:EchoBackend,fail=test_live_ws:FailBackend")
@@ -628,3 +630,18 @@ def test_client_error_event_closes_with_reason(server):
             break
     assert struct.unpack(">H", payload[:2])[0] == 1000
     assert payload[2:].decode() == "client_error:audio: engine stopped"
+
+
+def test_state_frames_reach_the_client_before_the_audio_they_announce(server, monkeypatch):
+    monkeypatch.setenv("MVG_LIVE_STATE_EVENTS", "1")
+    c = Client(server)
+    assert c.status == 101
+    c.send(live_ws.OP_BIN, struct.pack("<h", 3000) * 3840)  # 240 ms of speech; EchoBackend echoes it back
+    seen = []
+    while True:
+        op, payload = c.recv()
+        if op == live_ws.OP_BIN:
+            break
+        seen.append(json.loads(payload))
+    assert seen == [{"event": "state", "state": "received"}, {"event": "state", "state": "speaking"}]
+    c.send(live_ws.OP_TEXT, json.dumps({"event": "end"}).encode())

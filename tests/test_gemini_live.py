@@ -275,3 +275,53 @@ def test_missing_key_raises(monkeypatch):
     import pytest
     with pytest.raises(ValueError):
         asyncio.run(gl.GeminiLiveBackend().open({}))
+
+
+def test_input_transcription_becomes_an_input_transcript_event():
+    msg = {"serverContent": {"inputTranscription": {"text": "hello"}}}
+    assert gl.server_message_events(msg, {}) == [{"type": "input_transcript", "text": "hello"}]
+    assert gl.server_message_events({"serverContent": {"inputTranscription": {"text": "  "}}}, {}) == []
+    assert gl.server_message_events({"serverContent": {"inputTranscription": {"text": 5}}}, {}) == []
+    assert gl.server_message_events({"serverContent": {"inputTranscription": "hello"}}, {}) == []
+
+
+def _setup_for(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MVG_GEMINI_INPUT_TRANSCRIPTION", raising=False)
+    else:
+        monkeypatch.setenv("MVG_GEMINI_INPUT_TRANSCRIPTION", value)
+
+    async def main():
+        received = []
+
+        async def handle(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            _, data = await _ws_read(reader)
+            received.append(json.loads(data))
+            writer.write(_frame({"setupComplete": {}}))
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setenv("MVG_GEMINI_URL", f"ws://127.0.0.1:{port}/live")
+        monkeypatch.delenv("MVG_GEMINI_API_KEY", raising=False)
+        try:
+            b = gl.GeminiLiveBackend()
+            await b.open({})
+            await b.close()
+        finally:
+            server.close()
+        return received[0]["setup"]
+
+    return asyncio.run(main())
+
+
+def test_input_transcription_is_requested_only_when_the_flag_is_on(monkeypatch):
+    assert "inputAudioTranscription" not in _setup_for(monkeypatch, None)
+    assert "inputAudioTranscription" not in _setup_for(monkeypatch, "")
+    assert "inputAudioTranscription" not in _setup_for(monkeypatch, "0")
+    assert "inputAudioTranscription" not in _setup_for(monkeypatch, "Off")
+    assert _setup_for(monkeypatch, "1")["inputAudioTranscription"] == {}
+    assert _setup_for(monkeypatch, "true")["inputAudioTranscription"] == {}

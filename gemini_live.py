@@ -8,7 +8,9 @@ Implements talker_backend.TalkerBackend over the Gemini Live WebSocket API
 
 Env: MVG_GEMINI_API_KEY (required), MVG_GEMINI_MODEL (default below),
 MVG_GEMINI_VOICE (optional prebuilt voice name), MVG_GEMINI_URL (override the
-endpoint, used by tests and proxies), MVG_GEMINI_INSTRUCTIONS (system prompt).
+endpoint, used by tests and proxies), MVG_GEMINI_INSTRUCTIONS (system prompt),
+MVG_GEMINI_INPUT_TRANSCRIPTION (default 0; 1 sets setup.inputAudioTranscription and the
+server's serverContent.inputTranscription.text becomes an `input_transcript` event).
 
 The wire format follows Google's public Live API reference. The audio mime type
 (`audio/pcm;rate=16000`), 24 kHz PCM16 output and the FunctionCall/
@@ -26,7 +28,7 @@ import struct
 from typing import AsyncIterator
 from urllib.parse import urlsplit
 
-from talker_backend import TalkerBackend
+from talker_backend import TalkerBackend, env_flag
 
 DEFAULT_URL = ("wss://generativelanguage.googleapis.com/ws/"
                "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
@@ -144,6 +146,9 @@ def server_message_events(msg: dict, call_names: dict) -> list[dict]:
     out: list[dict] = []
     sc = msg.get("serverContent")
     if isinstance(sc, dict):
+        it = sc.get("inputTranscription")
+        if isinstance(it, dict) and isinstance(it.get("text"), str) and it["text"].strip():
+            out.append({"type": "input_transcript", "text": it["text"]})
         if sc.get("interrupted"):
             out.append({"type": "interrupted"})
         for part in ((sc.get("modelTurn") or {}).get("parts") or []):
@@ -210,6 +215,8 @@ class GeminiLiveBackend(TalkerBackend):
         instr = self._config.get("instructions") or os.environ.get("MVG_GEMINI_INSTRUCTIONS")
         if instr:
             setup["systemInstruction"] = {"parts": [{"text": str(instr)}]}
+        if env_flag("MVG_GEMINI_INPUT_TRANSCRIPTION", "0"):
+            setup["inputAudioTranscription"] = {}
         self._ws = await self._connect(url)
         await self._ws.send_json({"setup": setup})
         first = await self._ws.recv()

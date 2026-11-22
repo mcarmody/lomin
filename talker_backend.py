@@ -15,6 +15,8 @@ Capabilities (a frozenset of strings on the class):
 Event dicts yielded by `events()`:
   {"type": "audio", "pcm": bytes}
   {"type": "text", "text": str}
+  {"type": "input_transcript", "text": str}   optional: a backend with audio_in may emit it
+                                              when the user's speech is transcribed
   {"type": "tool_call", "call_id": str, "name": str, "args": dict}
   {"type": "interrupted"}
   {"type": "turn_end"}
@@ -34,7 +36,12 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 CAPABILITIES = frozenset({"audio_in", "audio_out", "text_out", "full_duplex", "tool_calls", "silent_context"})
-EVENT_TYPES = frozenset({"audio", "text", "tool_call", "interrupted", "turn_end", "error", "resume_handle", "reconnect"})
+EVENT_TYPES = frozenset({"audio", "text", "input_transcript", "tool_call", "interrupted", "turn_end", "error", "resume_handle", "reconnect"})
+
+
+def env_flag(name: str, default: str) -> bool:
+    """False for 0, false, no or off (any case). An unset or empty value uses `default`."""
+    return (os.environ.get(name) or default).strip().lower() not in ("0", "false", "no", "off")
 
 
 class TalkerBackend:

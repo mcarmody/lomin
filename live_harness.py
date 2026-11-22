@@ -26,14 +26,19 @@ import inspect
 import math
 import os
 import struct
+import sys
 import time
 import uuid
 from typing import Any, Callable
 
 from sentence_segmenter import SentenceSegmenter
+from talker_backend import env_flag
 
 MAX_REQUEST_CHARS = 4000
 TOOL_NAMES = ("call_thinker", "cancel_thinker", "answer_prompt", "set_progress_updates")
+STATE_RANK = {"listening": 0, "received": 1, "transcribing": 2, "thinking": 3, "synthesizing": 4, "speaking": 5}
+STALE_PHASES = ("received", "transcribing", "thinking")
+STALE_TURN_SEC = 8.0
 
 
 def _error(message: str) -> dict:
@@ -177,6 +182,20 @@ class LiveSession:
         self._audio_buf = bytearray()
         self._voiced_ms = 0.0
         self._silence_ms = 0.0
+        # State frames (see _set_phase). The detector counters are separate from _voiced_ms and
+        # _silence_ms, which only the cascaded buffer path owns.
+        self._phase = "listening"
+        self._state_events = env_flag("MVG_LIVE_STATE_EVENTS", "1")
+        self._vad_voiced_ms = 0.0
+        self._vad_silence_ms = 0.0
+        self.stale_sec = STALE_TURN_SEC
+        self._stale_task: asyncio.Task | None = None
+        # A call_thinker job is pending: the stale wait stays off until the last job ends, even across
+        # a return to listening (see _release_thinker_hold).
+        self._thinker_hold = False
+        # A cascaded reply request is in flight: its backend emits no event until the reply returns.
+        self._reply_wait = False
+        self._stale_deadline = 0.0
         self.config = dict(config or {})
         self.node_id = str(self.config.get("node_id") or "")
         self._send_to_client = send_to_client
@@ -252,9 +271,112 @@ class LiveSession:
         if not self._closed and isinstance(text, str) and text.strip():
             await self.backend.send_text(text, silent=silent)
 
+    # -- state frames --
+
+    def _thinker_pending(self) -> bool:
+        """A call_thinker job is queued or running: its brain result is still to come."""
+        return self._running is not None or not self._queue.empty()
+
+    def _stale_held(self) -> bool:
+        return self._thinker_hold or self._reply_wait
+
+    async def _stt_gave_nothing(self) -> None:
+        """The transcript is empty or failed. Only a turn still at `transcribing` returns to listening; a reply
+        that is being spoken keeps its state."""
+        if self._phase == "transcribing":
+            await self._set_phase("listening")
+
+    def _release_thinker_hold(self) -> None:
+        """A thinker job ended or was dropped. The hold ends with the last pending job; the stale wait
+        starts over if the phase still needs it."""
+        if not self._thinker_pending():
+            self._thinker_hold = False
+        self._touch_stale()
+
+    async def _set_phase(self, name: str) -> None:
+        """Tell the client which turn step is lit. A state goes out only if it ranks above the
+        current one; `listening` resets the turn."""
+        if not self._state_events or self._closed:
+            return
+        rank = STATE_RANK.get(name)
+        if rank is None:
+            print(f"lomin: live state: unknown state {str(name)[:40]!r}", file=sys.stderr)
+            return
+        if name == "listening":
+            self._thinker_hold = self._thinker_pending()
+            if self._phase == "listening":
+                return
+            self._vad_voiced_ms = 0.0
+            self._vad_silence_ms = 0.0
+        elif rank <= STATE_RANK[self._phase]:
+            return
+        self._phase = name
+        self._cancel_stale()
+        self._touch_stale()
+        await self._client({"type": "state", "state": name})
+
+    def _cancel_stale(self) -> None:
+        task, self._stale_task = self._stale_task, None
+        if task is not None:
+            task.cancel()
+
+    def _touch_stale(self) -> None:
+        """A backend event or voiced frame: the stale-turn wait starts over."""
+        if self._closed or self._phase not in STALE_PHASES or self._stale_held():
+            self._cancel_stale()
+            return
+        self._stale_deadline = time.monotonic() + self.stale_sec
+        if self._stale_task is None:
+            self._stale_task = asyncio.ensure_future(self._stale_wait())
+
+    async def _stale_wait(self) -> None:
+        try:
+            while self._stale_deadline - time.monotonic() > 0:
+                await asyncio.sleep(self._stale_deadline - time.monotonic())
+            self._stale_task = None
+            if self._phase in STALE_PHASES:
+                await self._set_phase("listening")
+        except Exception:  # noqa: BLE001 - a send on a closed socket must not leave an unretrieved task error
+            return
+
+    async def _detect_speech(self, pcm16_16k: bytes) -> None:
+        """Energy detector on the user's audio. HEARD after 200 ms of speech while listening or
+        received. Silence counts in listening, received and transcribing; 600 ms of it after speech
+        moves an audio_in backend to THINK. Voiced frames re-arm the stale wait in received and
+        transcribing, so long speech keeps the strip lit."""
+        if not self._state_events or self._phase not in ("listening", "received", "transcribing"):
+            return
+        n = len(pcm16_16k) // 2
+        if n == 0:
+            return
+        samples = struct.unpack(f"<{n}h", pcm16_16k[:n * 2])
+        rms = math.sqrt(sum(s * s for s in samples) / n)
+        dur_ms = n / 16.0
+        if rms >= 300.0:
+            self._vad_silence_ms = 0.0
+            if self._phase in ("listening", "received"):
+                self._vad_voiced_ms += dur_ms
+                if self._vad_voiced_ms >= 200.0:
+                    await self._set_phase("received")
+            if self._phase in ("received", "transcribing"):
+                self._touch_stale()
+        else:
+            self._vad_silence_ms += dur_ms
+            if self._vad_voiced_ms < 200.0:
+                if self._vad_silence_ms >= 300.0:
+                    self._vad_voiced_ms = 0.0
+                    self._vad_silence_ms = 0.0
+            elif self._vad_silence_ms >= 600.0:
+                self._vad_voiced_ms = 0.0
+                self._vad_silence_ms = 0.0
+                if "audio_in" in getattr(self.backend, "capabilities", frozenset()) \
+                        and self._phase in ("received", "transcribing"):
+                    await self._set_phase("thinking")
+
     async def feed_audio(self, pcm16_16k: bytes) -> None:
         if self._closed or not pcm16_16k:
             return
+        await self._detect_speech(pcm16_16k)
         if "audio_in" in getattr(self.backend, "capabilities", frozenset()):
             await self.backend.send_audio(pcm16_16k)
             return
@@ -283,12 +405,14 @@ class LiveSession:
         self._audio_buf.clear()
         self._voiced_ms = 0.0
         self._silence_ms = 0.0
+        await self._set_phase("transcribing")
         fn = self._transcribe
         if fn is None:
             try:
                 from gateway import transcribe as fn
             except Exception as exc:  # noqa: BLE001
                 await self._client({"type": "tts_error", "message": f"stt failed: {exc}"[:200]})
+                await self._stt_gave_nothing()
                 return None
         try:
             import audio_utils
@@ -297,11 +421,21 @@ class LiveSession:
             raw_text = await loop.run_in_executor(None, fn, wav)
         except Exception as exc:  # noqa: BLE001
             await self._client({"type": "tts_error", "message": f"stt failed: {exc}"[:200]})
+            await self._stt_gave_nothing()
             return None
         transcript = (raw_text or "").strip()
         if transcript:
-            await self.backend.send_text(transcript, silent=False)
+            # Before send_text: a cascaded backend awaits its whole reply inside it, and its events are
+            # dispatched meanwhile. Set later, thinking would rank below speaking and never go out.
+            self._reply_wait = True
+            try:
+                await self._set_phase("thinking")
+                await self.backend.send_text(transcript, silent=False)
+            finally:
+                self._reply_wait = False
+                self._touch_stale()
             return transcript
+        await self._stt_gave_nothing()
         return None
 
     async def run(self) -> None:
@@ -334,6 +468,7 @@ class LiveSession:
         self._closed = True
         self._clear_speech()
         self.relay.close()
+        self._cancel_stale()
         if self._hold_timer is not None:
             self._hold_timer.cancel()
             self._hold_timer = None
@@ -359,11 +494,20 @@ class LiveSession:
     async def _dispatch(self, ev: dict) -> bool:
         """False ends the session."""
         kind = ev.get("type") if isinstance(ev, dict) else None
+        self._touch_stale()
         if kind in ("audio", "text"):
             self._talker_busy = True  # it is speaking; cleared at turn_end
-        if kind == "tool_call":
+        if kind == "input_transcript":
+            # Not forwarded. It lights TEXT only while the user's turn is open: Gemini's transcription
+            # is not ordered against its other output, so a late chunk must not relight a finished turn.
+            if self._phase in ("received", "transcribing"):
+                await self._set_phase("transcribing")
+        elif kind == "tool_call":
             await self._flush_speech()
             result = await self._handle_tool(ev.get("name"), ev.get("args"))
+            if ev.get("name") == "call_thinker" and isinstance(result, dict) and result.get("status") == "started":
+                self._thinker_hold = True
+                await self._set_phase("thinking")
             await self.backend.send_tool_result(str(ev.get("call_id") or ""), result)
         elif kind == "text" and self._speak is not None and not ev.get("spoken"):
             await self._client(ev)
@@ -372,12 +516,19 @@ class LiveSession:
         elif kind == "turn_end":
             await self._flush_speech()
             await self._client(ev)
+            if self._phase in ("thinking", "synthesizing", "speaking"):
+                await self._set_phase("listening")
+                if self._thinker_pending():
+                    await self._set_phase("thinking")
             self._talker_busy = False
             await self._release_held()
         elif kind == "interrupted":
             self._clear_speech()
             await self._client(ev)
+            await self._set_phase("listening")
         elif kind in ("audio", "text"):
+            if kind == "audio":
+                await self._set_phase("speaking")
             await self._client(ev)
         elif kind == "resume_handle":
             return True
@@ -389,6 +540,7 @@ class LiveSession:
                 await self._client({"type": "error", "message": self.error})
                 return False
             self._talker_busy = False  # the old connection's turn ended with it
+            await self._set_phase("listening")
             await self._release_held()
         elif kind == "error":
             self.error = str(ev.get("message") or "backend error")
@@ -401,6 +553,7 @@ class LiveSession:
         the client as a non-fatal event; the text frame was already delivered."""
         if not text.strip():
             return
+        await self._set_phase("synthesizing")
         try:
             loop = asyncio.get_running_loop()
             wav = await loop.run_in_executor(None, self._speak, text)
@@ -412,6 +565,7 @@ class LiveSession:
             await self._client({"type": "tts_error", "message": str(exc)[:200]})
             return
         if pcm and not self._closed:
+            await self._set_phase("speaking")
             await self._client({"type": "audio", "pcm": pcm, "rate": 24000, "synthesized": True})
 
     # -- tools --
@@ -450,6 +604,7 @@ class LiveSession:
             outcome = await res if inspect.isawaitable(res) else res
         elif running is not None:
             outcome = "stopped_speech_only"
+        self._release_thinker_hold()
         return {"status": outcome, "dropped_queued": dropped}
 
     async def _work(self) -> None:
@@ -469,9 +624,11 @@ class LiveSession:
                 self._running = None
             if job["cancelled"] or self._closed:
                 self.relay.pending = None
+                self._release_thinker_hold()
                 continue
             await self.relay.finish()
             await self.send_context(f"[thinker result, handoff {job['id']}] {text}")
+            self._release_thinker_hold()
 
     @staticmethod
     def _result_text(result: Any) -> str:

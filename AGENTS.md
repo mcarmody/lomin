@@ -78,3 +78,4 @@ domains. The PR checklist lists the exact commands.
 - `MVG_SPOKEN_PROGRESS=1` (+ `MVG_PROGRESS_*`): spoken progress from `stages_out["events"]` (`ProgressNarrator`); tests in `tests/test_spoken_progress.py`.
 - `MVG_CONTEXT_OPENER=1`: opener from the first stage event (`_maybe_context_opener`); tests in `tests/test_context_opener.py`.
 - `MVG_PERSONA_DIR`: directory of per-target persona markdown files (`<MVG_PERSONA_DIR>/<target>/voice_talker.md` or `voice.md`) used as fallback Talker instructions on `/voice/live`.
+- `MVG_LIVE_STATE_EVENTS=1` (default): `state` frames on `/voice/live` light the turn strip (`LiveSession._set_phase`); tests in `tests/test_live_states.py`. `MVG_GEMINI_INPUT_TRANSCRIPTION` adds the gemini TEXT step.

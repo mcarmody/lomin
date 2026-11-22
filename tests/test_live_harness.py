@@ -11,6 +11,12 @@ import live_harness as lh  # noqa: E402
 from talker_backend import CascadedTextBackend, MockBackend  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_state_frames(monkeypatch):
+    """These tests list every frame the client gets; state frames are covered in test_live_states.py."""
+    monkeypatch.setenv("MVG_LIVE_STATE_EVENTS", "0")
+
+
 def call(cid, name, args):
     return {"type": "tool_call", "call_id": cid, "name": name, "args": args}
 

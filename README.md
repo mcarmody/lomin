@@ -235,6 +235,8 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_TALKER_URL` / `MVG_TALKER_MODEL` / `MVG_TALKER_KEY` / `MVG_TALKER_TIMEOUT` / `MVG_TALKER_INSTRUCTIONS` | unset / `gpt-4o-mini` / unset / `15` / built-in prompt — settings for the built-in `cascaded` text-in/text-out Talker backend (`MVG_TALKER_BACKEND=cascaded`, `talker_backend.py`) |
 | `MVG_LIVE_MAX_SEC` / `MVG_LIVE_IDLE_SEC` / `MVG_LIVE_MAX_FRAME` | `600` / `30` / `262144` — session length, idle timeout (seconds) and largest client frame (bytes) for `/voice/live` |
 | `MVG_LIVE_HOLD_MAX_SEC` | `45` — longest a progress line or thinker result waits for the Talker to finish its turn before it is sent anyway (`0`: wait for `turn_end` with no limit) |
+| `MVG_LIVE_STATE_EVENTS` | `1`: send `state` frames on `/voice/live` that light the turn strip. `0`, `false`, `no` or `off` stops them; an empty value means the default |
+| `MVG_GEMINI_INPUT_TRANSCRIPTION` | `0`: `1` asks the `gemini` backend to transcribe the user's speech, so the TEXT step lights there. `0`, `false`, `no` or `off` leave it out |
 | `MVG_SPOKEN_CANCEL` | `0` — `1` makes a spoken "stop" / "cancel that" on `/voice/turn` cancel the running turn (see Cancel) |
 | `MVG_CANCEL_PHRASES` | `stop,cancel,cancel that,never mind,nevermind,stop that` — comma list of exact cancel phrases |
 | `MVG_CONTEXT_OPENER` | `0` — `1` speaks "One moment, <detail>" from the first stage event in place of the generic opener clip (see Context opener) |
@@ -1121,6 +1123,13 @@ A bidirectional session driven by a Talker backend (`talker_backend.py`) and the
   - When the Talker calls `cancel_thinker`, `LiveSession` invokes `gateway.cancel_active_turn(node_id)`, which triggers the plugin's `brain_cancel(target, task_id)` hook.
 - Client binary frames: 16 kHz mono PCM16. Server binary frames: 24 kHz mono PCM16 from the Talker (or synthesized in `custom_tts` / text-out mode).
 - Text frames are JSON. Client to server: `{"event": "status"}` (speak the latest task progress), `{"event": "end"}`, `{"event": "client_error", "reason": "..."}` (the client gave up on its side; the reason lands in the request log as `client_error:<reason>`). Server to client: `{"event": "text"|"interrupted"|"turn_end"|"error", ...}`.
+- State frames: `/voice/live` sends `{"event": "state", "state": "<name>"}` text frames for the turn strip. `<name>` is `received`, `transcribing`, `thinking`, `synthesizing`, `speaking` or `listening`. A step is sent only when it ranks above the current one. A state frame carries no text or timestamp.
+`listening` resets the turn. It is sent after `turn_end` when the state is `thinking`, `synthesizing` or `speaking`.
+It is also sent after `interrupted`, after a successful reconnect, and after an empty transcript at `transcribing`.
+It is also sent after 8 seconds with no backend event while the state is `received`, `transcribing` or `thinking`.
+Voiced speech restarts that wait. A cascaded reply request in flight holds it, and so does a pending `call_thinker` job, until each ends.
+If `turn_end` leaves a `call_thinker` job pending, `thinking` follows `listening` until the job ends.
+On the `gemini` backend, `transcribing` needs `MVG_GEMINI_INPUT_TRANSCRIPTION=1`. Set `MVG_LIVE_STATE_EVENTS=0` to turn the frames off.
 - Close codes: 1000 normal, 1009 frame larger than `MVG_LIVE_MAX_FRAME`, 1011 backend error, 4000 idle for `MVG_LIVE_IDLE_SEC`, 4001 longer than `MVG_LIVE_MAX_SEC`.
 - Fallback: if the backend fails to open or errors mid-session, the server sends `{"event": "fallback", "endpoint": "/voice/turn", "reason": ...}` and then closes 1011. The client should continue the conversation on `/voice/turn`.
 - One line per session in `lomin.jsonl`: endpoint `/voice/live`, outcome, node, backend.
@@ -1133,6 +1142,6 @@ Two modes share one gateway:
 1. **Live (`/voice/live`)**: a Talker (`gemini` in `"native"` or `"custom_tts"` `voice_mode`, `cascaded`, or a plugin from `MVG_TALKER_BACKENDS`) holds the conversation and hands slow work to the brain with `call_thinker`. Needs `MVG_TALKER_BACKEND`. Failure falls back to mode 2 (see Fallback above).
 2. **Pipeline (`/voice/turn`)**: STT, brain, TTS per turn, with the delegate-first orchestrator prompt, spoken progress, spoken cancel and the context opener.
 
-Live-mode keys: `MVG_TALKER_BACKEND`, `MVG_TALKER_BACKENDS`, `MVG_PERSONA_DIR`, `MVG_LIVE_MAX_SEC`, `MVG_LIVE_IDLE_SEC`, `MVG_LIVE_MAX_FRAME`, for the `gemini` backend `MVG_GEMINI_API_KEY`, `MVG_GEMINI_MODEL` (default `gemini-3.8-live`), `MVG_GEMINI_VOICE`, `MVG_GEMINI_INSTRUCTIONS`, `MVG_GEMINI_URL`, and for the `cascaded` backend `MVG_TALKER_URL`, `MVG_TALKER_MODEL`, `MVG_TALKER_KEY`, `MVG_TALKER_TIMEOUT`, `MVG_TALKER_INSTRUCTIONS`. All are in the env table and `.env.example`. Per-node choice: `talker_backend` and `voice_mode` (`"native"` | `"custom_tts"`) in the node's `nodes.json` entry.
+Live-mode keys: `MVG_TALKER_BACKEND`, `MVG_TALKER_BACKENDS`, `MVG_PERSONA_DIR`, `MVG_LIVE_MAX_SEC`, `MVG_LIVE_IDLE_SEC`, `MVG_LIVE_MAX_FRAME`, `MVG_LIVE_STATE_EVENTS`, for the `gemini` backend `MVG_GEMINI_API_KEY`, `MVG_GEMINI_MODEL` (default `gemini-3.8-live`), `MVG_GEMINI_VOICE`, `MVG_GEMINI_INSTRUCTIONS`, `MVG_GEMINI_URL`, `MVG_GEMINI_INPUT_TRANSCRIPTION`, and for the `cascaded` backend `MVG_TALKER_URL`, `MVG_TALKER_MODEL`, `MVG_TALKER_KEY`, `MVG_TALKER_TIMEOUT`, `MVG_TALKER_INSTRUCTIONS`. All are in the env table and `.env.example`. Per-node choice: `talker_backend` and `voice_mode` (`"native"` | `"custom_tts"`) in the node's `nodes.json` entry.
 
 Files: `talker_backend.py` (contract, `MockBackend`, `CascadedTextBackend`, loader), `live_harness.py` (`LiveSession`, `ProgressRelay`, and the four tools), `live_ws.py` (WebSocket bridge), `gemini_live.py` (Gemini Live backend), `tools/gemini_live_smoke.py` (live smoke test, including `--test-silent-progress`). Run `MVG_GEMINI_API_KEY=... python3 tools/gemini_live_smoke.py --test-silent-progress` to verify against the live Gemini endpoint.
